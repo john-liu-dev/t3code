@@ -3,6 +3,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as DesktopConnectionCatalogStore from "../../app/DesktopConnectionCatalogStore.ts";
+import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import * as IpcChannels from "../channels.ts";
 import * as DesktopIpc from "../DesktopIpc.ts";
 
@@ -20,8 +21,21 @@ export const setConnectionCatalog = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.SET_CONNECTION_CATALOG_CHANNEL,
   payload: Schema.String,
   result: Schema.Boolean,
-  handler: Effect.fn("desktop.ipc.connectionCatalog.set")(function* (catalog) {
+  handler: Effect.fn("desktop.ipc.connectionCatalog.set")(function* (catalog, event) {
     const store = yield* DesktopConnectionCatalogStore.DesktopConnectionCatalogStore;
-    return yield* store.set(catalog);
+    const electronWindow = yield* Effect.serviceOption(ElectronWindow.ElectronWindow);
+    const stored = yield* store.set(catalog);
+    if (stored && Option.isSome(electronWindow)) {
+      if (event !== undefined && electronWindow.value.sendOthers !== undefined) {
+        yield* electronWindow.value
+          .sendOthers(event.sender.id, IpcChannels.CONNECTION_CATALOG_CHANGED_CHANNEL)
+          .pipe(Effect.ignoreCause);
+      } else if (event === undefined) {
+        yield* electronWindow.value
+          .sendAll(IpcChannels.CONNECTION_CATALOG_CHANGED_CHANNEL)
+          .pipe(Effect.ignoreCause);
+      }
+    }
+    return stored;
   }),
 });

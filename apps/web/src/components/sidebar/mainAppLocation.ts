@@ -24,18 +24,25 @@ export function isSidebarUtilityPage(pathname: string) {
 const SHELL_LESS_PATHS = new Set(["/pair", "/connect", "/connect-agent", GUEST_PAGE_PATH]);
 
 let mainAppHref: string | null = null;
+let lastNonSettingsHref: string | null = null;
 let appModalReturnHref: string | null = null;
 let appModalReturnHistoryIndex: number | null = null;
 let appModalReturnThreadTarget: ThreadRouteTarget | null = null;
 let initialHistoryIndex = 0;
+
+function isSettingsRoutePath(pathname: string) {
+  return pathname === "/settings" || pathname.startsWith("/settings/");
+}
 
 /** Remembers where Settings, Usage, and the utility pages lead back to. */
 export function startMainAppLocationTracking(router: AnyRouter): () => void {
   initialHistoryIndex = router.state.location.state.__TSR_index;
   const record = () => {
     const { pathname } = router.state.location;
-    if (isAppModalPage(pathname) || SHELL_LESS_PATHS.has(pathname)) return;
+    if (SHELL_LESS_PATHS.has(pathname)) return;
     const href = withoutAssistantCitationHash(router.state.location.href);
+    if (!isSettingsRoutePath(pathname)) lastNonSettingsHref = href;
+    if (isAppModalPage(pathname)) return;
     appModalReturnHref = href;
     // Only an entry that is exactly the return location can be stepped back to.
     appModalReturnHistoryIndex =
@@ -52,6 +59,11 @@ export function startMainAppLocationTracking(router: AnyRouter): () => void {
 /** The thread Settings or Usage opened over, for views mounted while the modal is open. */
 export function getAppModalReturnThreadTarget() {
   return appModalReturnThreadTarget;
+}
+
+/** Last non-settings app href recorded in this window (keeps Usage or PR list open when Settings opens in a separate window). */
+export function getAppModalReturnHref() {
+  return lastNonSettingsHref ?? appModalReturnHref ?? mainAppHref ?? "/";
 }
 
 export function useNavigateToMainApp() {

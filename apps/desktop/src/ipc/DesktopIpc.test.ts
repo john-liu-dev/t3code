@@ -65,3 +65,62 @@ it.effect("answers only the main window's top frame", () =>
     });
   }),
 );
+
+it.effect("answers the standalone settings window's top frame while rejecting its subframes", () =>
+  Effect.gen(function* () {
+    const mainFrame = {};
+    const settingsFrame = {};
+    const invoke = new Map<string, DesktopIpc.DesktopIpcHandleListener>();
+    const sync = new Map<string, DesktopIpc.DesktopIpcSyncListener>();
+    const ipc = yield* DesktopIpc.DesktopIpc.pipe(
+      Effect.provide(
+        DesktopIpc.layer({
+          removeHandler: (channel) => void invoke.delete(channel),
+          handle: (channel, listener) => void invoke.set(channel, listener),
+          removeAllListeners: (channel) => void sync.delete(channel),
+          on: (channel, listener) => void sync.set(channel, listener),
+        }).pipe(
+          Layer.provide(
+            Layer.mock(ElectronWindow.ElectronWindow, {
+              main: Effect.succeedSome({
+                webContents: { id: 1, mainFrame },
+              } as unknown as Electron.BrowserWindow),
+              settings: Effect.succeedSome({
+                webContents: { id: 3, mainFrame: settingsFrame },
+              } as unknown as Electron.BrowserWindow),
+            }),
+          ),
+        ),
+      ),
+    );
+    yield* ipc.handle(
+      DesktopIpc.makeIpcMethod({
+        channel: "token",
+        payload: Schema.Void,
+        result: Schema.String,
+        handler: () => Effect.succeed("secret"),
+      }),
+    );
+    yield* ipc.handleSync({ channel: "token-sync", handler: () => Effect.succeed("secret") });
+
+    const senders = {
+      settings: { sender: { id: 3 }, senderFrame: settingsFrame },
+      settingsSubframe: { sender: { id: 3 }, senderFrame: {} },
+    };
+    const results: Record<string, unknown> = {};
+    for (const [name, sender] of Object.entries(senders)) {
+      const event = { ...sender, returnValue: "unset" as unknown };
+      sync.get("token-sync")!(event);
+      results[name] = [
+        yield* Effect.promise(() =>
+          Promise.resolve(invoke.get("token")!(sender, undefined)).catch(() => "rejected"),
+        ),
+        event.returnValue,
+      ];
+    }
+    assert.deepEqual(results, {
+      settings: ["secret", "secret"],
+      settingsSubframe: ["rejected", undefined],
+    });
+  }),
+);

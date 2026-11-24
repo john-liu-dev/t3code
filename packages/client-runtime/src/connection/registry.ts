@@ -101,6 +101,7 @@ export class EnvironmentRegistry extends Context.Service<
     >;
     readonly networkStatus: SubscriptionRef.SubscriptionRef<NetworkStatus>;
     readonly start: Effect.Effect<void>;
+    readonly syncPersisted?: Effect.Effect<void>;
     /**
      * Succeeds with `false` and changes nothing when the environment is
      * platform-managed, since the host owns that entry. With `knownAddressOnly`, it fails like
@@ -1194,10 +1195,97 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const loadPersistedEntries = Effect.fn("EnvironmentRegistry.loadPersistedEntries")(function* () {
+    const nextTargets = yield* storage.list;
+    const nextDisabledIds = new Set(yield* storage.listDisabled);
+    const routesByEnvironment = new Map<EnvironmentId, Array<ConnectionTarget>>();
+    for (const target of nextTargets) {
+      const routes = routesByEnvironment.get(target.environmentId) ?? [];
+      routes.push(target);
+      routesByEnvironment.set(target.environmentId, routes);
+    }
+    return new Map(
+      yield* Effect.forEach(
+        routesByEnvironment,
+        Effect.fn("EnvironmentRegistry.loadCatalogEntry")(function* ([environmentId, targets]) {
+          const loaded = yield* Effect.forEach(targets, loadRoute, { concurrency: "unbounded" });
+          const seen = new Set<string>();
+          const usable = loaded.filter((route) => {
+            const id = connectionRouteId(route.target);
+            if (seen.has(id)) return false;
+            seen.add(id);
+            return !(id.startsWith("learned:") && Option.isNone(route.profile));
+          });
+          const routes = usable.length > 0 ? usable : loaded.slice(0, 1);
+          const first = routes[0]!;
+          return [
+            environmentId,
+            entryWithRoutes(
+              {
+                target: first.target,
+                profile: first.profile,
+                enabled: !nextDisabledIds.has(environmentId),
+              },
+              routes,
+            ),
+          ] as const;
+        }),
+        { concurrency: "unbounded" },
+      ),
+    );
+  });
+
+  const syncPersisted = Effect.gen(function* () {
+    if (storage.reload !== undefined) {
+      yield* storage.reload;
+    }
+    const desired = yield* loadPersistedEntries();
+    const platformIds = yield* Ref.get(platformEnvironmentIds);
+    const previousPersisted = yield* Ref.get(persistedEnvironmentIds);
+
+    for (const [environmentId, entry] of desired) {
+      if (platformIds.has(environmentId)) continue;
+      yield* withLeaseLock(
+        environmentId,
+        Effect.gen(function* () {
+          if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) return;
+          yield* Ref.update(persistedEnvironmentIds, (current) => {
+            const next = new Set(current);
+            next.add(environmentId);
+            return next;
+          });
+          yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
+        }),
+      );
+    }
+
+    for (const environmentId of previousPersisted) {
+      if (desired.has(environmentId) || platformIds.has(environmentId)) continue;
+      yield* withLeaseLock(
+        environmentId,
+        Effect.gen(function* () {
+          if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) return;
+          yield* closeServiceScope(environmentId);
+          yield* SubscriptionRef.update(entries, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          });
+          yield* Ref.update(persistedEnvironmentIds, (current) => {
+            const next = new Set(current);
+            next.delete(environmentId);
+            return next;
+          });
+        }),
+      );
+    }
+  }).pipe(Effect.withSpan("EnvironmentRegistry.syncPersisted"), Effect.ignoreCause);
+
   return EnvironmentRegistry.of({
     entries,
     networkStatus,
     start,
+    syncPersisted,
     register,
     assertKnownAddress,
     reconcilePlatform,

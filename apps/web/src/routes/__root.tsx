@@ -39,6 +39,7 @@ import { ChatGptWelcomeCoordinator } from "../components/settings/ChatGptWelcome
 import { ThemeEditorHost } from "../components/settings/ThemeEditorHost";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { Button } from "../components/ui/button";
+import { SidebarProvider } from "../components/ui/sidebar";
 import { StandalonePage, StandalonePageHeader } from "../components/ui/standalone-page";
 import { AnchoredToastProvider, ToastProvider } from "../components/ui/toast";
 import { isElectron } from "../env";
@@ -62,9 +63,23 @@ import { readProject } from "../state/entities";
 import { getDesktopSnapShotBridge } from "../lib/desktopSnapShot";
 import { isChunkLoadError } from "../lib/chunkReloadGuard";
 import { shouldResumeSnapShotSetupOnStartup } from "../lib/snapShotSetupResume";
+import {
+  canOpenStandaloneSettingsWindow,
+  getLastStandaloneSettingsHref,
+  isRouterPreloadLocation,
+  isStandaloneSettingsWindow,
+  openInMainDesktopWindow,
+  openStandaloneSettingsWindow,
+  parseInternalRedirectTarget,
+  setLastStandaloneSettingsHref,
+} from "../lib/standaloneSettingsWindow";
+
+function isSettingsPathname(pathname: string): boolean {
+  return pathname === "/settings" || pathname.startsWith("/settings/");
+}
 
 export const Route = createRootRoute({
-  beforeLoad: async ({ location }) => {
+  beforeLoad: async ({ location, preload }) => {
     // Guest links open on the owner's tunnel host in a browser with no T3 session, and must
     // not trigger pairing or an environment connection.
     if (location.pathname === GUEST_PAGE_PATH) {
@@ -83,7 +98,37 @@ export const Route = createRootRoute({
       };
     }
 
+    const isPreload = isRouterPreloadLocation(location, preload);
+    const enforceStandaloneSettingsRoute = () => {
+      if (!isStandaloneSettingsWindow()) return;
+      if (isSettingsPathname(location.pathname)) {
+        if (!isPreload && location.pathname !== "/settings") {
+          setLastStandaloneSettingsHref(location.href);
+        }
+        return;
+      }
+      if (
+        location.pathname === "/pair" ||
+        location.pathname === "/connect" ||
+        location.pathname === "/connect-agent" ||
+        location.pathname === "/approve-agent"
+      ) {
+        return;
+      }
+      // Hover/focus intent preloads must never trigger cross-window navigation side effects.
+      if (isPreload) return;
+      if (location.pathname === "/") {
+        throw redirect({ to: "/settings/general", replace: true });
+      }
+      openInMainDesktopWindow(location.href);
+      throw redirect({
+        ...parseInternalRedirectTarget(getLastStandaloneSettingsHref()),
+        replace: true,
+      });
+    };
+
     if (isLocalEnvironmentDisabled() || isHostedStaticApp(new URL(window.location.href))) {
+      enforceStandaloneSettingsRoute();
       return {
         authGateState: {
           status: "hosted-static",
@@ -96,13 +141,22 @@ export const Route = createRootRoute({
       // Idempotent, so every navigation can ask for it.
       void configureClientTracing();
     }
+    if (isStandaloneSettingsWindow()) {
+      enforceStandaloneSettingsRoute();
+      return { authGateState };
+    }
     if (
+      !isPreload &&
       authGateState.status === "authenticated" &&
       getDesktopSnapShotBridge() &&
       shouldResumeSnapShotSetupOnStartup() &&
       location.pathname !== "/settings/snap-shot"
     ) {
-      throw redirect({ to: "/settings/snap-shot", replace: true });
+      if (canOpenStandaloneSettingsWindow()) {
+        openStandaloneSettingsWindow("/settings/snap-shot");
+      } else {
+        throw redirect({ to: "/settings/snap-shot", replace: true });
+      }
     }
     return {
       authGateState,
@@ -181,6 +235,29 @@ function RootRouteBranch() {
   const isWelcome = pathname === "/welcome";
   if (authGateState.status !== "authenticated" && authGateState.status !== "hosted-static") {
     return <Outlet />;
+  }
+
+  if (isStandaloneSettingsWindow()) {
+    return (
+      <>
+        <ChatGptWelcomeCoordinator />
+        <RelayClientInstallDialog />
+        <ConnectOnboardingDialog />
+        <SshPasswordPromptDialog />
+        <ConfirmDialogHost />
+        <CustomSnoozeDialogHost />
+        <ProjectCloneToastCoordinator />
+        <ConnectDeviceApprovalCoordinator />
+        <AddProjectToMachineDialogHost />
+        <UseInAnotherAppDialogHost />
+        <CommandPalette>
+          <SidebarProvider defaultOpen className="h-dvh! min-h-0! overflow-hidden">
+            <Outlet />
+          </SidebarProvider>
+        </CommandPalette>
+        <ThemeEditorHost />
+      </>
+    );
   }
 
   // Settings can reopen /welcome mid-session, so it mounts everything the app does except the

@@ -8,10 +8,19 @@ import { resolveThreadRouteTarget } from "../threadRoutes";
 import { retainThreadFindForRoute } from "../components/chat/threadFindStore";
 import { ThreadLinkPrompt } from "../components/promptLinks/ThreadLinkPrompt";
 import { useShownThreadRouteTarget } from "../hooks/useShownThreadRouteTarget";
+import { isStandaloneSettingsWindow } from "../lib/standaloneSettingsWindow";
 
 function ChatRouteLayout() {
   // Render both routes here so draft promotion keeps the same ChatView mounted.
   const { shownTarget, modalOpen } = useShownThreadRouteTarget();
+  if (isStandaloneSettingsWindow()) {
+    return (
+      <>
+        <Outlet />
+        <GlobalVoiceInputIndicator />
+      </>
+    );
+  }
   return (
     <>
       {shownTarget?.kind === "server" && !modalOpen ? (

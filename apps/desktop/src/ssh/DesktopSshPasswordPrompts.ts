@@ -284,7 +284,16 @@ export const make = Effect.fn("desktop.sshPasswordPrompts.make")(function* (
   const request: DesktopSshPasswordPrompts["Service"]["request"] = Effect.fn(
     "desktop.sshPasswordPrompts.request",
   )(function* (input) {
-    const window = yield* electronWindow.main;
+    const settingsWindow = yield* ElectronWindow.readSettingsWindow(electronWindow);
+    const focusedWindow = Option.isSome(settingsWindow)
+      ? yield* electronWindow.focusedMainOrFirst.pipe(Effect.catchCause(() => Effect.succeedNone))
+      : Option.none<Electron.BrowserWindow>();
+    const window =
+      Option.isSome(settingsWindow) &&
+      Option.isSome(focusedWindow) &&
+      focusedWindow.value === settingsWindow.value
+        ? settingsWindow
+        : yield* electronWindow.main;
     if (Option.isNone(window)) {
       return yield* new DesktopSshPromptWindowUnavailableError({
         destination: input.destination,

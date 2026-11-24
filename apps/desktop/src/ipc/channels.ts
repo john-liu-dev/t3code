@@ -48,6 +48,11 @@ export const GET_LOCAL_ENVIRONMENT_BEARER_TOKEN_CHANNEL =
   "desktop:get-local-environment-bearer-token";
 export const GET_CLIENT_SETTINGS_CHANNEL = "desktop:get-client-settings";
 export const SET_CLIENT_SETTINGS_CHANNEL = "desktop:set-client-settings";
+export const CLIENT_SETTINGS_CHANGED_CHANNEL = "desktop:client-settings-changed";
+export const OPEN_SETTINGS_WINDOW_CHANNEL = "desktop:open-settings-window";
+export const OPEN_IN_MAIN_WINDOW_CHANNEL = "desktop:open-in-main-window";
+export const WINDOW_NAVIGATE_CHANNEL = "desktop:window-navigate";
+export const SETTINGS_WINDOW_ARGUMENT = "--t3code-window-surface=settings";
 export const SETUP_SNAP_SHOT_CHANNEL = "desktop:setup-snap-shot";
 export const PREVIEW_SNAP_SHOT_CONFIG_CHANNEL = "desktop:preview-snap-shot-config";
 export const APPLY_SNAP_SHOT_CONFIG_CHANNEL = "desktop:apply-snap-shot-config";
@@ -64,6 +69,7 @@ export const DISMISS_SNAP_SHOT_ANIMATION_CHANNEL = "desktop:dismiss-snap-shot-an
 export const ACKNOWLEDGE_SNAP_SHOT_CHANNEL = "desktop:acknowledge-snap-shot";
 export const GET_CONNECTION_CATALOG_CHANNEL = "desktop:get-connection-catalog";
 export const SET_CONNECTION_CATALOG_CHANNEL = "desktop:set-connection-catalog";
+export const CONNECTION_CATALOG_CHANGED_CHANNEL = "desktop:connection-catalog-changed";
 export const DISCOVER_SSH_HOSTS_CHANNEL = "desktop:discover-ssh-hosts";
 export const RESOLVE_SSH_HOST_CHANNEL = "desktop:resolve-ssh-host";
 export const ENSURE_SSH_ENVIRONMENT_CHANNEL = "desktop:ensure-ssh-environment";

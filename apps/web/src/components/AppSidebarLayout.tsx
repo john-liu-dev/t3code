@@ -44,6 +44,7 @@ import { HistorySwipeNavigation } from "./HistorySwipeNavigation";
 import ThreadSidebar from "./Sidebar";
 import { SidebarBrandWidthProbe } from "./sidebar/SidebarChrome";
 import { isAppModalPage } from "./sidebar/mainAppLocation";
+import { openStandaloneSettingsWindow } from "../lib/standaloneSettingsWindow";
 import type { SidebarRouteReveal } from "./sidebar/routeReveal";
 import { useSidebarStageBackdropVariant } from "./SidebarStageBackdrop";
 import {
@@ -114,6 +115,10 @@ function readWindowFullscreen(): boolean {
       typeof getWindowFullscreenState === "function" ? getWindowFullscreenState() : false;
   }
   return windowFullscreenSnapshot;
+}
+
+export function useDesktopWindowFullscreen(): boolean {
+  return useSyncExternalStore(subscribeToWindowFullscreen, readWindowFullscreen, () => false);
 }
 
 function readInitialThreadSidebarWidth(): number {
@@ -305,6 +310,7 @@ function registerAppShellCommands(router: AnyRouter, shellElement: Element): () 
     registerWorkspaceFocusCommands(router),
     registerPullRequestsEscapeCommand(router),
     registerMenuAction("open-settings", () => {
+      if (openStandaloneSettingsWindow()) return;
       if (!/^\/settings(\/|$)/.test(router.state.location.pathname))
         void router.navigate({ to: "/settings" });
     }),

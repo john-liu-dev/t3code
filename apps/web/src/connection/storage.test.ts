@@ -62,6 +62,43 @@ describe("ConnectionStorage.makeCatalogStore", () => {
       expect(yield* Effect.flip(store.read)).toBe(failure);
     }),
   );
+
+  it.effect(
+    "re-reads from backend before updating so separate windows do not overwrite each other",
+    () =>
+      Effect.gen(function* () {
+        let persisted: string | null = encodeCatalog(emptyCatalog);
+        const backend: ConnectionStorage.CatalogBackend = {
+          read: Effect.sync(() => persisted),
+          write: (raw) =>
+            Effect.sync(() => {
+              persisted = raw;
+            }),
+        };
+        const mainStore = yield* ConnectionStorage.makeCatalogStore(backend);
+        const settingsStore = yield* ConnectionStorage.makeCatalogStore(backend);
+
+        // Prime both window caches.
+        expect(yield* mainStore.read).toEqual(emptyCatalog);
+        expect(yield* settingsStore.read).toEqual(emptyCatalog);
+
+        // Settings window disables env-1.
+        const envOne = EnvironmentId.make("env-1");
+        const envTwo = EnvironmentId.make("env-2");
+        yield* settingsStore.update((document) => ({
+          ...document,
+          disabledEnvironmentIds: [...document.disabledEnvironmentIds, envOne],
+        }));
+
+        // Main window updates env-2 without overwriting settings window's write.
+        yield* mainStore.update((document) => ({
+          ...document,
+          disabledEnvironmentIds: [...document.disabledEnvironmentIds, envTwo],
+        }));
+
+        expect((yield* settingsStore.reload).disabledEnvironmentIds).toEqual([envOne, envTwo]);
+      }),
+  );
 });
 
 const fixedHandle = (database: IDBDatabase) => ({

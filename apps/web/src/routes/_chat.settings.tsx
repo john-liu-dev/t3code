@@ -1,10 +1,21 @@
 import { workspaceAreaProps } from "../lib/workspaceFocus";
 import { Outlet, createFileRoute, redirect, useLocation } from "@tanstack/react-router";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { T, useGT, useMessages, Var } from "gt-react";
-import { RotateCcwIcon } from "lucide-react";
+import { RotateCcwIcon, XIcon } from "lucide-react";
 import { Button } from "../components/ui/button";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../components/ui/tooltip";
 import { useSettingsRestore } from "../components/settings/SettingsPanels";
+import { cn } from "../lib/utils";
+import { getAppModalReturnHref } from "../components/sidebar/mainAppLocation";
+import {
+  canOpenStandaloneSettingsWindow,
+  isRouterPreloadLocation,
+  isStandaloneSettingsWindow,
+  openStandaloneSettingsWindow,
+  parseInternalRedirectTarget,
+  setLastStandaloneSettingsHref,
+} from "../lib/standaloneSettingsWindow";
 
 import { AppRouteModal, AppRouteModalClose } from "../components/AppRouteModal";
 import { SettingsBreadcrumb } from "../components/settings/SettingsBreadcrumb";
@@ -140,6 +151,94 @@ function SettingsScopeBoundary({ pathname, children }: { pathname: string; child
   return children;
 }
 
+const STANDALONE_ESCAPE_BLOCKING_OVERLAY_SELECTOR = [
+  '[role="dialog"]:not([data-app-modal])',
+  '[aria-modal="true"]:not([data-app-modal])',
+  '[data-open][data-slot="select-popup"]',
+  '[data-open][data-slot="combobox-popup"]',
+  '[data-open][data-slot="autocomplete-popup"]',
+  '[data-open][data-slot="menu-popup"]',
+  '[data-open][data-slot="popover-popup"]',
+  '[data-open][data-slot="dialog-popup"]:not([data-app-modal])',
+  '[data-open][data-slot="alert-dialog-popup"]',
+  '[data-open][data-slot="command-dialog-popup"]',
+  '[data-open][data-slot="sheet-popup"]',
+].join(", ");
+
+function StandaloneSettingsWindowSurface({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  const surfaceRef = useRef<HTMLDivElement>(null);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Escape closes the standalone settings window when no inner popup owns focus
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.key !== "Escape") return;
+      const target = event.target;
+      if (
+        (target instanceof HTMLElement &&
+          (target.closest('[data-keybinding-capture], [aria-expanded="true"]') !== null ||
+            target.closest(STANDALONE_ESCAPE_BLOCKING_OVERLAY_SELECTOR) !== null)) ||
+        document.querySelector(STANDALONE_ESCAPE_BLOCKING_OVERLAY_SELECTOR) !== null
+      ) {
+        return;
+      }
+      event.preventDefault();
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && surfaceRef.current?.contains(focused)) {
+        focused.blur();
+      }
+      window.close();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  return (
+    <div
+      ref={surfaceRef}
+      role="region"
+      aria-label={label}
+      data-app-modal=""
+      className="relative flex size-full min-h-0 min-w-0 flex-col overflow-hidden bg-background text-foreground outline-none"
+    >
+      {children}
+    </div>
+  );
+}
+
+function StandaloneSettingsCloseButton() {
+  const gt = useGT();
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            className="wco:hidden"
+            aria-label={gt("Close")}
+            onClick={() => {
+              const focused = document.activeElement;
+              if (focused instanceof HTMLElement) focused.blur();
+              window.close();
+            }}
+          />
+        }
+      >
+        <XIcon />
+      </TooltipTrigger>
+      <TooltipPopup side="bottom">
+        <T>Close (Esc)</T>
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
 function SettingsContentLayout() {
   const gt = useGT();
   const contentArea = workspaceAreaProps("settings", 1, gt("Settings content"));
@@ -150,32 +249,52 @@ function SettingsContentLayout() {
       ? environment?.environmentId
       : JSON.stringify(search);
   const [restoreSignal, setRestoreSignal] = useState(0);
+  const standaloneWindow = isStandaloneSettingsWindow();
 
-  return (
-    <AppRouteModal label={gt("Settings")}>
-      <div className="relative flex min-h-0 flex-1">
-        <SettingsSidebarNav pathname={location.pathname} />
-        <div {...contentArea} className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <header className="flex h-12 shrink-0 items-center gap-3 border-b ps-5 pe-2">
-            <SettingsBreadcrumb pathname={location.pathname} />
-            <div className="ms-auto flex shrink-0 items-center gap-1">
-              {location.pathname === "/settings/general" ? (
-                <RestoreDeviceDefaultsButton
-                  onRestored={() => setRestoreSignal((value) => value + 1)}
-                />
-              ) : null}
-              <AppRouteModalClose />
-            </div>
-          </header>
-          <div key={`${contentScopeKey}:${restoreSignal}`} className="min-h-0 flex flex-1 flex-col">
-            <SettingsScopeBoundary pathname={location.pathname}>
-              <Outlet />
-            </SettingsScopeBoundary>
+  const content = (
+    <div className="relative flex min-h-0 flex-1">
+      <SettingsSidebarNav pathname={location.pathname} />
+      <div {...contentArea} className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <header
+          className={cn(
+            "flex h-12 shrink-0 items-center gap-3 border-b ps-5 pe-2",
+            standaloneWindow &&
+              "select-none [-webkit-app-region:drag] wco:pe-(--workspace-native-controls-inset)",
+          )}
+        >
+          <SettingsBreadcrumb pathname={location.pathname} />
+          <div
+            className={cn(
+              "ms-auto flex shrink-0 items-center gap-1",
+              standaloneWindow && "[-webkit-app-region:no-drag]",
+            )}
+          >
+            {location.pathname === "/settings/general" ? (
+              <RestoreDeviceDefaultsButton
+                onRestored={() => setRestoreSignal((value) => value + 1)}
+              />
+            ) : null}
+            {standaloneWindow ? <StandaloneSettingsCloseButton /> : <AppRouteModalClose />}
           </div>
+        </header>
+        <div key={`${contentScopeKey}:${restoreSignal}`} className="min-h-0 flex flex-1 flex-col">
+          <SettingsScopeBoundary pathname={location.pathname}>
+            <Outlet />
+          </SettingsScopeBoundary>
         </div>
       </div>
-    </AppRouteModal>
+    </div>
   );
+
+  if (standaloneWindow) {
+    return (
+      <StandaloneSettingsWindowSurface label={gt("Settings")}>
+        {content}
+      </StandaloneSettingsWindowSurface>
+    );
+  }
+
+  return <AppRouteModal label={gt("Settings")}>{content}</AppRouteModal>;
 }
 
 function SettingsRouteLayout() {
@@ -209,12 +328,37 @@ function SettingsRouteLayout() {
 export const Route = createFileRoute("/_chat/settings")({
   validateSearch: validateSettingsRouteSearch,
   search: { middlewares: [retainSettingsScope] },
-  beforeLoad: async ({ location }) => {
+  beforeLoad: async ({ location, preload }) => {
+    const isPreload = isRouterPreloadLocation(location, preload);
+    const moved = movedSettingsPath(location.pathname, location.hash);
+    if (canOpenStandaloneSettingsWindow()) {
+      // Hover/focus intent preloads must never pop open the standalone settings window.
+      if (isPreload) return;
+      const resolvedPath =
+        moved ?? (location.pathname === "/settings" ? "/settings/general" : location.pathname);
+      const searchSuffix = location.searchStr
+        ? location.searchStr.startsWith("?")
+          ? location.searchStr
+          : `?${location.searchStr}`
+        : "";
+      const hashSuffix = location.hash
+        ? location.hash.startsWith("#")
+          ? location.hash
+          : `#${location.hash}`
+        : "";
+      openStandaloneSettingsWindow(`${resolvedPath}${searchSuffix}${hashSuffix}`);
+      throw redirect({
+        ...parseInternalRedirectTarget(getAppModalReturnHref()),
+        replace: true,
+      });
+    }
     if (location.pathname === "/settings") {
       throw redirect({ to: "/settings/general", replace: true });
     }
-    const moved = movedSettingsPath(location.pathname, location.hash);
     if (moved) throw redirect({ to: moved, search: true, hash: true, replace: true });
+    if (isStandaloneSettingsWindow() && !isPreload && location.pathname.startsWith("/settings/")) {
+      setLastStandaloneSettingsHref(location.href);
+    }
   },
   component: SettingsRouteLayout,
 });

@@ -80,6 +80,7 @@ let clientSettingsHydrationGeneration = 0;
 let clientSettingsPersistenceQueue: Promise<void> = Promise.resolve();
 let deferredClientSettingsPatchCount = 0;
 let unsubscribeOtherTabClientSettings: (() => void) | null = null;
+let unsubscribeDesktopClientSettings: (() => void) | null = null;
 
 function emitClientSettingsChange() {
   for (const listener of clientSettingsListeners) {
@@ -160,6 +161,12 @@ async function hydrateClientSettings(): Promise<void> {
       unsubscribeOtherTabClientSettings ??= subscribeBrowserClientSettingsWrites(
         refreshClientSettingsFromOtherTab,
       );
+      if (typeof window !== "undefined") {
+        unsubscribeDesktopClientSettings ??=
+          window.desktopBridge?.onClientSettingsChange?.((nextSettings) => {
+            applyExternalClientSettings(nextSettings);
+          }) ?? null;
+      }
       setClientSettingsHydrationStatus("ready");
     } catch (error) {
       if (hydrationGeneration === clientSettingsHydrationGeneration) {
@@ -187,11 +194,28 @@ function refreshClientSettingsFromOtherTab(): void {
   void enqueueClientSettingsPersistence(async () => {
     const persistedSettings = await ensureLocalApi().persistence.getClientSettings();
     if (persistedSettings) {
-      replaceClientSettingsSnapshot({ ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings });
+      const nextSettings = { ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings };
+      if (!Equal.equals(getClientSettingsSnapshot(), nextSettings)) {
+        replaceClientSettingsSnapshot(nextSettings);
+      }
     }
   }).catch((error) => {
     console.error(`${CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE} refresh failed`, {
       operation: "refresh",
+      ...safeErrorLogAttributes(error),
+    });
+  });
+}
+
+function applyExternalClientSettings(persistedSettings: ClientSettings): void {
+  const nextSettings = { ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings };
+  void enqueueClientSettingsPersistence(async () => {
+    if (!Equal.equals(getClientSettingsSnapshot(), nextSettings)) {
+      replaceClientSettingsSnapshot(nextSettings);
+    }
+  }).catch((error) => {
+    console.error(`${CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE} sync failed`, {
+      operation: "sync",
       ...safeErrorLogAttributes(error),
     });
   });
@@ -821,6 +845,8 @@ export function __resetClientSettingsPersistenceForTests(): void {
   deferredClientSettingsPatchCount = 0;
   unsubscribeOtherTabClientSettings?.();
   unsubscribeOtherTabClientSettings = null;
+  unsubscribeDesktopClientSettings?.();
+  unsubscribeDesktopClientSettings = null;
   clientSettingsListeners.clear();
   clientSettingsHydrationListeners.clear();
 }

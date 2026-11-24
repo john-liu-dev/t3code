@@ -49,6 +49,8 @@ import {
   getPreferredSystemLanguages,
   getPrimaryPasteEnabled,
   getWindowFullscreenState,
+  openSettingsWindow,
+  openInMainWindow,
   openExternal,
   readMedia,
   restartAudioService,
@@ -112,6 +114,8 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handleSync(getPreferredSystemLanguages);
   yield* ipc.handleSync(getPrimaryPasteEnabled);
   yield* ipc.handleSync(getWindowFullscreenState);
+  yield* ipc.handle(openSettingsWindow);
+  yield* ipc.handle(openInMainWindow);
   yield* ipc.handleSync(getLocalEnvironmentBootstraps);
   yield* ipc.handleSync(getLocalEnvironmentEnabled);
   yield* ipc.handle(setLocalEnvironmentEnabled);

@@ -3,10 +3,12 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import type { ClientSettings } from "@t3tools/contracts/settings";
 import { createBrowserHistory, createHashHistory } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
+import { environmentCatalog } from "./connection/catalog";
 
 import { applyAppearanceContrast } from "./appearanceContrast";
 import { applyAppearanceFontVariables, TYPOGRAPHY_ADVANCED_STORAGE_KEY } from "./appearanceFonts";
@@ -61,9 +63,11 @@ import { primaryRelayTracingAllowedAtom, primaryServerConfigAtom } from "./state
 import { environmentShell } from "./state/shell";
 import { installChatRouteCommands } from "./shortcuts/chatRouteCommands";
 import { startWorkspaceFocus } from "./lib/workspaceFocus";
+import { msg } from "gt-react";
 import { m } from "./i18n/messages";
 import { startI18n, subscribeI18n } from "./i18n/runtime";
 import { guardDomAgainstPageTranslation } from "./lib/pageTranslationGuard";
+import { isStandaloneSettingsWindow } from "./lib/standaloneSettingsWindow";
 import { installCommandPaletteCommands } from "./shortcuts/commandPaletteCommands";
 import { registerOpenFavoriteEditorCommand } from "./components/chat/OpenInPickerShortcut";
 import { environmentThreadShells, threadEnvironment } from "./state/threads";
@@ -156,6 +160,11 @@ function startDocumentTitle(router: AppRouter): void {
   let openThreadRef = readOpenThreadRef(router);
   let onGuestPage = readOnGuestPage();
   const write = () => {
+    if (isStandaloneSettingsWindow()) {
+      const settingsTitle = m(msg("Settings"));
+      if (document.title !== settingsTitle) document.title = settingsTitle;
+      return;
+    }
     // GuestPage titles the tab after the shared thread.
     if (onGuestPage) return;
     const thread =
@@ -265,10 +274,19 @@ export function startAppServices(): AppRouter {
 
   // Electron loads the app from a file-backed shell, so hash history avoids path resolution issues.
   const router = getRouter(isElectron ? createHashHistory() : createBrowserHistory());
+  const standaloneSettings = isStandaloneSettingsWindow();
 
   if (isElectron) {
     syncDocumentElectronPlatformClasses(navigator.platform);
     syncDocumentWindowControlsOverlayClass();
+    window.desktopBridge?.onWindowNavigate?.((href) => {
+      void router.navigate({ href });
+    });
+    window.desktopBridge?.onConnectionCatalogChange?.(() => {
+      void runAtomCommand(appAtomRegistry, environmentCatalog.syncPersisted, undefined, {
+        reportFailure: false,
+      });
+    });
   }
 
   installDesktopPasteAsText(window.desktopBridge, window);
@@ -286,41 +304,51 @@ export function startAppServices(): AppRouter {
   startBrowserChromeThemeSync(router);
   startDefaultThemeAdoption();
   startModelPreferencesMigration();
-  startAgentOpenedPreviews();
-  if (isElectron) startElectronBrowserHost();
-  startPreviewTitleRecording();
-  startBrowserProfileReporting();
-  installChatRouteCommands(router);
+  if (!standaloneSettings) {
+    startAgentOpenedPreviews();
+    if (isElectron) startElectronBrowserHost();
+    startPreviewTitleRecording();
+    startBrowserProfileReporting();
+    installChatRouteCommands(router);
+  }
   installCommandPaletteCommands(router);
-  registerOpenFavoriteEditorCommand();
-  startThreadOverlayRetention(router);
+  if (!standaloneSettings) {
+    registerOpenFavoriteEditorCommand();
+    startThreadOverlayRetention(router);
+  }
   // Drafts promote as their server threads arrive, wherever the user is.
-  subscribeDraftThreadPromotion({
-    registry: appAtomRegistry,
-    threadShellAtom: environmentThreadShells.quietThreadShellAtom,
-    threadRefsAtom: environmentThreadShells.threadRefsAtom,
-  });
-  subscribeComposerDraftModelReconciliation({
-    registry: appAtomRegistry,
-    threadShellAtom: environmentThreadShells.threadShellAtom,
-    threadRefsAtom: environmentThreadShells.threadRefsAtom,
-    shellStateAtom: environmentShell.stateAtom,
-    pendingThreadIdsAtom: threadEnvironment.pendingThreadIdsAtom,
-  });
-  startMainAppLocationTracking(router);
+  if (!standaloneSettings) {
+    subscribeDraftThreadPromotion({
+      registry: appAtomRegistry,
+      threadShellAtom: environmentThreadShells.quietThreadShellAtom,
+      threadRefsAtom: environmentThreadShells.threadRefsAtom,
+    });
+    subscribeComposerDraftModelReconciliation({
+      registry: appAtomRegistry,
+      threadShellAtom: environmentThreadShells.threadShellAtom,
+      threadRefsAtom: environmentThreadShells.threadRefsAtom,
+      shellStateAtom: environmentShell.stateAtom,
+      pendingThreadIdsAtom: threadEnvironment.pendingThreadIdsAtom,
+    });
+    startMainAppLocationTracking(router);
+  }
   startWorkspaceFocus(router);
-  startBackgroundThreadAnnouncements(appAtomRegistry, router);
-  startThreadVisitedMigration(appAtomRegistry);
+  if (!standaloneSettings) {
+    startBackgroundThreadAnnouncements(appAtomRegistry, router);
+    startThreadVisitedMigration(appAtomRegistry);
+  }
   startSshPasswordPromptQueue();
 
   startKeybindingsUpdateToasts();
   startSlowRpcRequestToasts();
   startHostFreezeToasts();
-  startLegacyThreadMigrationToast();
-  startPermissionUpdateNotices(router);
-  startThreadNotifications(appAtomRegistry, router);
-  startGuideRunNotifications(appAtomRegistry, router);
-  if (isElectron) startDesktopUpdateLaunchNotice();
+  if (!standaloneSettings) {
+    startLegacyThreadMigrationToast();
+    startPermissionUpdateNotices(router);
+    startThreadNotifications(appAtomRegistry, router);
+    startGuideRunNotifications(appAtomRegistry, router);
+    if (isElectron) startDesktopUpdateLaunchNotice();
+  }
 
   return router;
 }

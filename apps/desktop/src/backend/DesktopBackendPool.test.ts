@@ -207,6 +207,8 @@ function layerPool(
           createMain: Effect.die("unexpected window create"),
           ensureMain: Effect.die("unexpected window ensure"),
           revealOrCreateMain: Effect.die("unexpected window reveal"),
+          openSettings: () => Effect.die("unexpected openSettings"),
+          openInMain: () => Effect.die("unexpected openInMain"),
           activate: Effect.die("unexpected window activate"),
           createMainIfBackendReady: Effect.die("unexpected window create"),
           showConnectingSplash: Effect.void,

@@ -10,6 +10,7 @@ import {
   setupSnapShot,
   previewSnapShotConfig,
   applySnapShotConfig,
+  listPendingSnapShots,
   snapShotRelativeFrame,
 } from "./snapShot.ts";
 
@@ -93,6 +94,40 @@ describe("window capture IPC", () => {
       ),
     );
   });
+  it.effect(
+    "allows capture setup from the standalone settings window while keeping delivery main-only",
+    () => {
+      const actions: string[] = [];
+      return Effect.gen(function* () {
+        yield* setupSnapShot.handler("install-extension", { sender: { id: 9 } });
+        assert.deepEqual(actions, ["install-extension"]);
+        const deliveryFromSettings = yield* Effect.exit(
+          listPendingSnapShots.handler(undefined, { sender: { id: 9 } }),
+        );
+        assert(Exit.isFailure(deliveryFromSettings));
+        const deliveryFromMain = yield* listPendingSnapShots.handler(undefined, {
+          sender: { id: 7 },
+        });
+        assert.deepEqual(deliveryFromMain, []);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(ElectronWindow.ElectronWindow, {
+              main: Effect.succeedSome({ webContents: { id: 7 } }),
+              settings: Effect.succeedSome({ webContents: { id: 9 } }),
+            } as ElectronWindow.ElectronWindow["Service"]),
+            Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
+              setup: (action: string) =>
+                Effect.sync(() => {
+                  actions.push(action);
+                }),
+              listPending: Effect.succeed([]),
+            } as unknown as DesktopSnapShot.DesktopSnapShot["Service"]),
+          ),
+        ),
+      );
+    },
+  );
 });
 
 it("normalizes Wayland attachment coordinates without trusting Electron's screen origin", () => {

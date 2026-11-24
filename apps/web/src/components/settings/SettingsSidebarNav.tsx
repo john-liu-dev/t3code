@@ -37,7 +37,10 @@ import { resolveEventKeys } from "@t3tools/shared/keybindings";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { T, useGT, useMessages } from "gt-react";
 
-import { cn } from "../../lib/utils";
+import { cn, isMacPlatform } from "../../lib/utils";
+import { isElectron } from "../../env";
+import { isStandaloneSettingsWindow } from "../../lib/standaloneSettingsWindow";
+import { useDesktopWindowFullscreen } from "../AppSidebarLayout";
 import { Button } from "../ui/button";
 import { Kbd } from "../ui/kbd";
 import {
@@ -138,6 +141,9 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
   const m = useMessages();
   const navArea = workspaceAreaProps("settings-nav", 0, gt("Settings sections"));
   const navigate = useNavigate();
+  const standaloneWindow = isStandaloneSettingsWindow();
+  const isMacosDesktop = isElectron && isMacPlatform(navigator.platform);
+  const isWindowFullscreen = useDesktopWindowFullscreen();
   const currentHash = useLocation({ select: (location) => location.hash });
   const activePath = SETTINGS_DETAIL_PAGE_PARENTS[pathname] ?? pathname;
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -264,10 +270,21 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
       role="navigation"
       className={cn(
         "flex w-60 shrink-0 flex-col border-e bg-sidebar text-sidebar-foreground max-md:w-14",
+        standaloneWindow && isMacosDesktop && !isWindowFullscreen && "max-md:w-22",
         compactSearchOpen &&
           "max-md:absolute max-md:inset-y-0 max-md:start-0 max-md:z-10 max-md:w-full",
       )}
     >
+      {standaloneWindow ? (
+        isMacosDesktop && !isWindowFullscreen ? (
+          <div
+            aria-hidden="true"
+            className="h-12 shrink-0 border-b border-sidebar-border/60 [-webkit-app-region:drag]"
+          />
+        ) : (
+          <div aria-hidden="true" className="h-2 shrink-0 [-webkit-app-region:drag]" />
+        )
+      ) : null}
       <SidebarContent className="overflow-x-hidden">
         <SidebarGroup>
           <div className="flex flex-col gap-2">

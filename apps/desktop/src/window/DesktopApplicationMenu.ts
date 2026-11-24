@@ -55,6 +55,11 @@ const dispatchMenuAction = Effect.fn("desktop.menu.dispatchMenuAction")(function
   });
 });
 
+const openSettingsWindow = Effect.gen(function* () {
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  yield* desktopWindow.openSettings();
+}).pipe(Effect.withSpan("desktop.menu.openSettings"));
+
 const zoomMainWindow = Effect.fn("desktop.menu.zoomMainWindow")(function* (
   direction: DesktopWindow.MainWindowZoomDirection,
 ): Effect.fn.Return<void, never, DesktopWindow.DesktopWindow> {
@@ -213,7 +218,7 @@ export const make = Effect.gen(function* () {
       runMenuEffect("check-for-updates", handleCheckForUpdatesMenuClick);
     };
     const settingsClick = () => {
-      runMenuEffect("open-settings", dispatchMenuAction("open-settings"));
+      runMenuEffect("open-settings", openSettingsWindow);
     };
     const pasteAsTextClick = (
       _item: Electron.MenuItem,

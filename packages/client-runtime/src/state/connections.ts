@@ -191,6 +191,15 @@ export function createEnvironmentCatalogAtoms<R, E>(
         Effect.flatMap((registry) => registry.retryNow(environmentId)),
       ),
   });
+  const syncPersisted = createRuntimeCommand(runtime, {
+    label: "environment-catalog:sync-persisted",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: () =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.syncPersisted ?? Effect.void),
+      ),
+  });
 
   return {
     catalogAtom,
@@ -207,6 +216,7 @@ export function createEnvironmentCatalogAtoms<R, E>(
     reorderRoutes,
     removeRelayEnvironments,
     retryNow,
+    syncPersisted,
     setEnabled,
   };
 }

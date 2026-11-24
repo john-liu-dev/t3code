@@ -97,6 +97,8 @@ const layerDesktopWindow = (selectedAction: Deferred.Deferred<string>) =>
     createMain: Effect.die("unexpected createMain"),
     ensureMain: Effect.die("unexpected ensureMain"),
     revealOrCreateMain: Effect.die("unexpected revealOrCreateMain"),
+    openSettings: () => Deferred.succeed(selectedAction, "open-settings").pipe(Effect.asVoid),
+    openInMain: () => Effect.void,
     activate: Effect.void,
     createMainIfBackendReady: Effect.void,
     showConnectingSplash: Effect.void,

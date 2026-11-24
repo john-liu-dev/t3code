@@ -47,7 +47,11 @@ import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import * as ElectronShell from "../electron/ElectronShell.ts";
 import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
-import { SNAP_SHOT_EVENT_CHANNEL } from "../ipc/channels.ts";
+import {
+  SETTINGS_WINDOW_ARGUMENT,
+  SNAP_SHOT_EVENT_CHANNEL,
+  WINDOW_NAVIGATE_CHANNEL,
+} from "../ipc/channels.ts";
 import * as DesktopServerExposure from "../backend/DesktopServerExposure.ts";
 import * as DesktopWindow from "./DesktopWindow.ts";
 import {
@@ -237,8 +241,10 @@ const desktopWindowBoundsEquivalence = Schema.toEquivalence(
 
 function layerTest(input: {
   readonly window: Electron.BrowserWindow;
+  readonly secondaryWindow?: Electron.BrowserWindow;
   readonly createCount: Ref.Ref<number>;
   readonly mainWindow: Ref.Ref<Option.Option<Electron.BrowserWindow>>;
+  readonly settingsWindow?: Ref.Ref<Option.Option<Electron.BrowserWindow>>;
   readonly createdWindowOptions?: Electron.BrowserWindowConstructorOptions[];
   readonly desktopSettings?: DesktopAppSettings.DesktopSettings;
   readonly mainWindowBoundsUpdates?: DesktopAppSettings.DesktopWindowBounds[];
@@ -304,11 +310,21 @@ function layerTest(input: {
       Effect.sync(() => {
         input.createdWindowOptions?.push(options);
       }).pipe(
-        Effect.andThen(Ref.update(input.createCount, (count) => count + 1)),
-        Effect.andThen(input.onWindowCreate ?? Effect.void),
-        Effect.as(input.window),
+        Effect.andThen(Ref.updateAndGet(input.createCount, (count) => count + 1)),
+        Effect.tap(() => input.onWindowCreate ?? Effect.void),
+        Effect.map((count) =>
+          count > 1 && input.secondaryWindow !== undefined ? input.secondaryWindow : input.window,
+        ),
       ),
     main: Ref.get(input.mainWindow),
+    ...(input.settingsWindow === undefined
+      ? {}
+      : {
+          settings: Ref.get(input.settingsWindow),
+          setSettings: (window: Electron.BrowserWindow) =>
+            Ref.set(input.settingsWindow!, Option.some(window)),
+          clearSettings: () => Ref.set(input.settingsWindow!, Option.none()),
+        }),
     currentMainOrFirst: Ref.get(input.mainWindow).pipe(
       Effect.map(Option.orElse(() => Option.fromNullishOr(input.fallbackWindow ?? null))),
     ),
@@ -1842,6 +1858,103 @@ describe("DesktopWindow", () => {
         assert.equal(yield* Ref.get(createCount), 1);
         assert.equal(fakeWindow.send.mock.calls.length, 0);
         assert.equal(onReveal.mock.calls.length, 0);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect(
+    "opens a standalone settings window and reuses it on subsequent settings navigations",
+    () =>
+      Effect.gen(function* () {
+        const mainFake = makeFakeBrowserWindow();
+        const settingsFake = makeFakeBrowserWindow();
+        (settingsFake.window.webContents as { id: number }).id = 2;
+        const createdOptions: Electron.BrowserWindowConstructorOptions[] = [];
+        const createCount = yield* Ref.make(0);
+        const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+        const settingsWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(
+          Option.none(),
+        );
+        const revealed: Electron.BrowserWindow[] = [];
+
+        const layer = layerTest({
+          window: mainFake.window,
+          secondaryWindow: settingsFake.window,
+          createCount,
+          mainWindow,
+          settingsWindow,
+          createdWindowOptions: createdOptions,
+          onReveal: (win) => {
+            revealed.push(win);
+          },
+        });
+
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+          yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+          mainFake.windowListeners.get("ready-to-show")?.();
+
+          yield* desktopWindow.openSettings();
+          settingsFake.windowListeners.get("ready-to-show")?.();
+
+          assert.equal(yield* Ref.get(createCount), 2);
+          assert.include(
+            createdOptions[1]?.webPreferences?.additionalArguments ?? [],
+            SETTINGS_WINDOW_ARGUMENT,
+          );
+          assert.equal(
+            settingsFake.loadURL.mock.calls[0]?.[0],
+            "t3code-dev://app/#/settings/general",
+          );
+          assert.isTrue(revealed.includes(settingsFake.window));
+
+          revealed.length = 0;
+          yield* desktopWindow.openSettings();
+          assert.equal(yield* Ref.get(createCount), 2);
+          assert.equal(settingsFake.send.mock.calls.length, 0);
+          assert.deepEqual(revealed, [settingsFake.window]);
+
+          revealed.length = 0;
+          yield* desktopWindow.openSettings("/settings/appearance#theme");
+          assert.equal(yield* Ref.get(createCount), 2);
+          assert.deepEqual(settingsFake.send.mock.calls, [
+            [WINDOW_NAVIGATE_CHANNEL, "/settings/appearance#theme"],
+          ]);
+          assert.deepEqual(revealed, [settingsFake.window]);
+        }).pipe(Effect.provide(layer));
+      }),
+  );
+
+  it.effect("creates only one settings window when openSettings is called concurrently", () =>
+    Effect.gen(function* () {
+      const mainFake = makeFakeBrowserWindow();
+      const settingsFake = makeFakeBrowserWindow();
+      (settingsFake.window.webContents as { id: number }).id = 2;
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const settingsWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+
+      const layer = layerTest({
+        window: mainFake.window,
+        secondaryWindow: settingsFake.window,
+        createCount,
+        mainWindow,
+        settingsWindow,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        mainFake.windowListeners.get("ready-to-show")?.();
+
+        yield* Effect.all(
+          [
+            desktopWindow.openSettings("/settings/general"),
+            desktopWindow.openSettings("/settings/appearance"),
+          ],
+          { concurrency: "unbounded" },
+        );
+        assert.equal(yield* Ref.get(createCount), 2);
       }).pipe(Effect.provide(layer));
     }),
   );

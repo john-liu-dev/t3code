@@ -555,6 +555,7 @@ export function makeCatalogBackend(database: DatabaseHandle): CatalogBackend {
 
 interface CatalogStore {
   readonly read: Effect.Effect<ConnectionCatalogDocumentType, ConnectionTransientError>;
+  readonly reload: Effect.Effect<ConnectionCatalogDocumentType, ConnectionTransientError>;
   readonly update: (
     transform: (catalog: ConnectionCatalogDocumentType) => ConnectionCatalogDocumentType,
   ) => Effect.Effect<void, ConnectionTransientError>;
@@ -566,52 +567,60 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
   const state = yield* Ref.make<Option.Option<ConnectionCatalogDocumentType>>(Option.none());
   const lock = yield* Semaphore.make(1);
 
+  const loadFromBackendUnlocked = Effect.fn("web.connectionStorage.loadCatalogFromBackend")(
+    function* () {
+      const raw = yield* backend.read;
+      let catalog = EMPTY_CONNECTION_CATALOG_DOCUMENT;
+      if (raw !== null && raw.trim() !== "") {
+        catalog = yield* decodeCatalog(raw).pipe(
+          Effect.catch((error) =>
+            Effect.gen(function* () {
+              yield* Effect.logWarning("Discarding a corrupt web connection catalog.", {
+                error: error.message,
+              });
+              if (backend.quarantine !== undefined) {
+                yield* backend.quarantine(raw).pipe(
+                  Effect.catch((cause) =>
+                    Effect.logWarning("Could not quarantine the corrupt web connection catalog.", {
+                      error: cause.message,
+                    }),
+                  ),
+                );
+              }
+              const encoded = yield* encodeCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT);
+              yield* backend.write(encoded).pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning("Could not persist the recovered web connection catalog.", {
+                    error: cause.message,
+                  }),
+                ),
+              );
+              return EMPTY_CONNECTION_CATALOG_DOCUMENT;
+            }),
+          ),
+        );
+      }
+      yield* Ref.set(state, Option.some(catalog));
+      return catalog;
+    },
+  );
+
   const loadUnlocked = Effect.fn("web.connectionStorage.loadCatalog")(function* () {
     const cached = yield* Ref.get(state);
     if (Option.isSome(cached)) {
       return cached.value;
     }
-    const raw = yield* backend.read;
-    let catalog = EMPTY_CONNECTION_CATALOG_DOCUMENT;
-    if (raw !== null && raw.trim() !== "") {
-      catalog = yield* decodeCatalog(raw).pipe(
-        Effect.catch((error) =>
-          Effect.gen(function* () {
-            yield* Effect.logWarning("Discarding a corrupt web connection catalog.", {
-              error: error.message,
-            });
-            if (backend.quarantine !== undefined) {
-              yield* backend.quarantine(raw).pipe(
-                Effect.catch((cause) =>
-                  Effect.logWarning("Could not quarantine the corrupt web connection catalog.", {
-                    error: cause.message,
-                  }),
-                ),
-              );
-            }
-            const encoded = yield* encodeCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT);
-            yield* backend.write(encoded).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("Could not persist the recovered web connection catalog.", {
-                  error: cause.message,
-                }),
-              ),
-            );
-            return EMPTY_CONNECTION_CATALOG_DOCUMENT;
-          }),
-        ),
-      );
-    }
-    yield* Ref.set(state, Option.some(catalog));
-    return catalog;
+    return yield* loadFromBackendUnlocked();
   });
 
   const read = lock.withPermits(1)(loadUnlocked());
+  const reload = lock.withPermits(1)(loadFromBackendUnlocked());
   const update: CatalogStore["update"] = Effect.fn("web.connectionStorage.updateCatalog")(
     function* (transform) {
       yield* lock.withPermits(1)(
         Effect.gen(function* () {
-          const next = transform(yield* loadUnlocked());
+          // Always re-read under the lock so concurrent updates from another desktop window are preserved.
+          const next = transform(yield* loadFromBackendUnlocked());
           yield* backend.write(yield* encodeCatalog(next));
           yield* Ref.set(state, Option.some(next));
         }),
@@ -619,7 +628,7 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
     },
   );
 
-  return { read, update } satisfies CatalogStore;
+  return { read, reload, update } satisfies CatalogStore;
 });
 
 // The stored names predate the rename and stay, so a tab still on an older version and an
@@ -769,6 +778,10 @@ export const layer = Layer.effectContext(
       listDisabled: catalog.read.pipe(
         Effect.map((document) => document.disabledEnvironmentIds),
         Effect.mapError((cause) => persistenceError("list-disabled-targets", cause)),
+      ),
+      reload: catalog.reload.pipe(
+        Effect.asVoid,
+        Effect.mapError((cause) => persistenceError("list-targets", cause)),
       ),
     });
     const registrationStore = Persistence.ConnectionRegistrationStore.of({

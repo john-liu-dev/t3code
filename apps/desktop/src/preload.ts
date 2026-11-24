@@ -45,6 +45,9 @@ try {
 
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Electron exposes the client platform in its sandboxed preload process.
 const clientPlatform = process.platform;
+const windowRole: "main" | "settings" = process.argv.includes(IpcChannels.SETTINGS_WINDOW_ARGUMENT)
+  ? "settings"
+  : "main";
 
 if (clientPlatform === "darwin") {
   // Native buttons ignore Chromium zoom; reserve native points even after reload.
@@ -113,6 +116,19 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     }
     return result as ReturnType<DesktopBridge["getAppBranding"]>;
   },
+  getWindowRole: () => windowRole,
+  openSettingsWindow: (href) => ipcRenderer.invoke(IpcChannels.OPEN_SETTINGS_WINDOW_CHANNEL, href),
+  openInMainWindow: (href) => ipcRenderer.invoke(IpcChannels.OPEN_IN_MAIN_WINDOW_CHANNEL, href),
+  onWindowNavigate: (listener) => {
+    const wrappedListener = (_event: Electron.IpcRendererEvent, href: unknown) => {
+      if (typeof href !== "string") return;
+      listener(href);
+    };
+    ipcRenderer.on(IpcChannels.WINDOW_NAVIGATE_CHANNEL, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.WINDOW_NAVIGATE_CHANNEL, wrappedListener);
+    };
+  },
   getRelayTelemetryEnabled: () => {
     const enabled = ipcRenderer.sendSync(IpcChannels.GET_RELAY_TELEMETRY_ENABLED_CHANNEL);
     return enabled === null ? null : enabled === true;
@@ -166,6 +182,16 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   getClientSettings: () => ipcRenderer.invoke(IpcChannels.GET_CLIENT_SETTINGS_CHANNEL),
   setClientSettings: (settings) =>
     ipcRenderer.invoke(IpcChannels.SET_CLIENT_SETTINGS_CHANNEL, settings),
+  onClientSettingsChange: (listener) => {
+    const wrappedListener = (_event: Electron.IpcRendererEvent, settings: unknown) => {
+      if (typeof settings !== "object" || settings === null) return;
+      listener(settings as Parameters<typeof listener>[0]);
+    };
+    ipcRenderer.on(IpcChannels.CLIENT_SETTINGS_CHANGED_CHANNEL, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.CLIENT_SETTINGS_CHANGED_CHANNEL, wrappedListener);
+    };
+  },
   requestSnapShotPermissions: (includeAccessibility) =>
     ipcRenderer.invoke(IpcChannels.REQUEST_SNAP_SHOT_PERMISSIONS_CHANNEL, includeAccessibility),
   getSnapShotState: () => ipcRenderer.invoke(IpcChannels.GET_SNAP_SHOT_STATE_CHANNEL),
@@ -187,6 +213,13 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   getConnectionCatalog: () => ipcRenderer.invoke(IpcChannels.GET_CONNECTION_CATALOG_CHANNEL),
   setConnectionCatalog: (catalog) =>
     ipcRenderer.invoke(IpcChannels.SET_CONNECTION_CATALOG_CHANNEL, catalog),
+  onConnectionCatalogChange: (listener) => {
+    const wrappedListener = () => listener();
+    ipcRenderer.on(IpcChannels.CONNECTION_CATALOG_CHANGED_CHANNEL, wrappedListener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannels.CONNECTION_CATALOG_CHANGED_CHANNEL, wrappedListener);
+    };
+  },
   discoverSshHosts: () => ipcRenderer.invoke(IpcChannels.DISCOVER_SSH_HOSTS_CHANNEL),
   resolveSshHost: (alias) => ipcRenderer.invoke(IpcChannels.RESOLVE_SSH_HOST_CHANNEL, alias),
   ensureSshEnvironment: async (target, options) =>

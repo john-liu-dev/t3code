@@ -32,10 +32,12 @@ import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import {
   MENU_ACTION_CHANNEL,
   QUIT_SHORTCUT_CHANNEL,
+  SETTINGS_WINDOW_ARGUMENT,
   SNAP_SHOT_EVENT_CHANNEL,
   TRACKPAD_SCROLL_BEGIN_CHANNEL,
   TRACKPAD_SCROLL_END_CHANNEL,
   WINDOW_FULLSCREEN_STATE_CHANNEL,
+  WINDOW_NAVIGATE_CHANNEL,
 } from "../ipc/channels.ts";
 import {
   PASSKEY_BRIDGE_ARGUMENT,
@@ -64,6 +66,7 @@ class ContextMenuImageCopyError extends Schema.TaggedError<ContextMenuImageCopyE
 }
 // Match --workspace-topbar-height in apps/web/src/index.css; native macOS buttons stay 14 points at any zoom.
 const MACOS_WORKSPACE_TOPBAR_HEIGHT = 52;
+const MACOS_SETTINGS_TOPBAR_HEIGHT = 48;
 const MACOS_WINDOW_BUTTON_RADIUS = 7;
 
 function parseMailtoAddress(rawUrl: string): Option.Option<string> {
@@ -81,15 +84,36 @@ function parseMailtoAddress(rawUrl: string): Option.Option<string> {
   }
 }
 
-function syncMacosWindowButtons(window: Electron.BrowserWindow): void {
+function syncMacosWindowButtons(
+  window: Electron.BrowserWindow,
+  topbarHeight = MACOS_WORKSPACE_TOPBAR_HEIGHT,
+): void {
   if (window.isDestroyed() || window.isFullScreen()) return;
   window.setWindowButtonPosition({
     x: 16,
     y: Math.round(
-      (MACOS_WORKSPACE_TOPBAR_HEIGHT * window.webContents.getZoomFactor()) / 2 -
-        MACOS_WINDOW_BUTTON_RADIUS,
+      (topbarHeight * window.webContents.getZoomFactor()) / 2 - MACOS_WINDOW_BUTTON_RADIUS,
     ),
   });
+}
+
+function normalizeSettingsHref(rawHref?: string): string {
+  const trimmed = rawHref?.trim() ?? "";
+  if (trimmed === "" || trimmed === "/settings") return "/settings/general";
+  if (
+    trimmed.startsWith("/settings/") ||
+    trimmed.startsWith("/settings?") ||
+    trimmed.startsWith("/settings#")
+  ) {
+    return trimmed.replace(/^\/settings(?=[?#])/, "/settings/general");
+  }
+  return "/settings/general";
+}
+
+function buildDesktopRouteUrl(applicationUrl: string, routeHref: string): string {
+  const url = new URL(applicationUrl);
+  url.hash = routeHref.startsWith("/") ? routeHref : `/${routeHref}`;
+  return url.toString();
 }
 
 const TITLEBAR_COLOR = "#01000000"; // #00000000 does not work correctly on Linux
@@ -134,6 +158,8 @@ export class DesktopWindow extends Context.Service<
     readonly createMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
     readonly ensureMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
     readonly revealOrCreateMain: Effect.Effect<Electron.BrowserWindow, DesktopWindowError>;
+    readonly openSettings: (href?: string) => Effect.Effect<void, DesktopWindowError>;
+    readonly openInMain: (href: string) => Effect.Effect<void, DesktopWindowError>;
     readonly activate: Effect.Effect<void, DesktopWindowError>;
     readonly createMainIfBackendReady: Effect.Effect<void, DesktopWindowError>;
     readonly showConnectingSplash: Effect.Effect<void>;
@@ -269,6 +295,19 @@ export function resolveInitialMainWindowBounds(
   return DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE;
 }
 
+function resolveInitialSettingsWindowBounds(
+  persistedBounds: DesktopAppSettings.DesktopWindowBounds | null,
+  displays: readonly DisplayBounds[],
+): DesktopAppSettings.DesktopWindowBounds | typeof DesktopAppSettings.DEFAULT_SETTINGS_WINDOW_SIZE {
+  if (
+    persistedBounds !== null &&
+    displays.some((display) => windowFitsWithinDisplay(persistedBounds, display))
+  ) {
+    return persistedBounds;
+  }
+  return DesktopAppSettings.DEFAULT_SETTINGS_WINDOW_SIZE;
+}
+
 function buildConnectingSplashDataUrl(
   shouldUseDarkColors: boolean,
   progress: DatabaseMigrationProgress | null,
@@ -335,13 +374,14 @@ function concealPendingQuitWindow(
 function getWindowTitleBarOptions(
   shouldUseDarkColors: boolean,
   platform: NodeJS.Platform,
+  macosTopbarHeight = MACOS_WORKSPACE_TOPBAR_HEIGHT,
 ): WindowTitleBarOptions {
   if (platform === "darwin") {
     return {
       titleBarStyle: "hiddenInset",
       trafficLightPosition: {
         x: 16,
-        y: MACOS_WORKSPACE_TOPBAR_HEIGHT / 2 - MACOS_WINDOW_BUTTON_RADIUS,
+        y: macosTopbarHeight / 2 - MACOS_WINDOW_BUTTON_RADIUS,
       },
     };
   }
@@ -416,12 +456,188 @@ export const make = Effect.gen(function* () {
   const runFork = Effect.runForkWith(context);
   const runPromise = Effect.runPromiseWith(context);
   const mainWindowMutex = yield* Semaphore.make(1);
+  const settingsWindowMutex = yield* Semaphore.make(1);
+  const settingsWindowLocalRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(
+    Option.none(),
+  );
   const pendingMainReveals = new WeakMap<Electron.BrowserWindow, Effect.Effect<void>>();
+  const pendingSettingsReveals = new WeakMap<Electron.BrowserWindow, Effect.Effect<void>>();
   const revealMain = Effect.fn("desktop.window.revealMain")((window: Electron.BrowserWindow) =>
     Effect.suspend(() => pendingMainReveals.get(window) ?? electronWindow.reveal(window)),
   );
+  const revealSettings = Effect.fn("desktop.window.revealSettings")(
+    (window: Electron.BrowserWindow) =>
+      Effect.suspend(() => pendingSettingsReveals.get(window) ?? electronWindow.reveal(window)),
+  );
   let flushMainWindowBounds: Effect.Effect<void> = Effect.void;
+  let flushSettingsWindowBounds: Effect.Effect<void> = Effect.void;
   let remoteRequestHeaderOwner: Electron.BrowserWindow | null = null;
+  let detachSharedRemoteRequestHeaders: (() => void) | null = null;
+  const trustedRemoteHeaderWebContentsIds = new Set<number>();
+
+  const ensureRemoteRequestHeaderPolicy = (window: Electron.BrowserWindow) => {
+    trustedRemoteHeaderWebContentsIds.add(window.webContents.id);
+    if (remoteRequestHeaderOwner !== null && !remoteRequestHeaderOwner.isDestroyed()) {
+      return;
+    }
+    detachSharedRemoteRequestHeaders?.();
+    remoteRequestHeaderOwner = window;
+    detachSharedRemoteRequestHeaders = installMainWindowRemoteRequestHeaderPolicy(
+      window.webContents.session,
+      {
+        desktopOrigin: getDesktopOrigin(environment.isDevelopment),
+        mainWebContentsId: window.webContents.id,
+        trustedWebContentsIds: trustedRemoteHeaderWebContentsIds,
+        clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
+        devServerOrigin: Option.getOrUndefined(
+          Option.map(environment.devServerUrl, (url) => url.origin),
+        ),
+        isDevelopment: environment.isDevelopment,
+      },
+    );
+  };
+
+  const releaseRemoteRequestHeaderPolicy = (window: Electron.BrowserWindow) => {
+    trustedRemoteHeaderWebContentsIds.delete(window.webContents.id);
+    if (remoteRequestHeaderOwner === window) {
+      remoteRequestHeaderOwner = null;
+      if (trustedRemoteHeaderWebContentsIds.size === 0) {
+        detachSharedRemoteRequestHeaders?.();
+        detachSharedRemoteRequestHeaders = null;
+      }
+    }
+  };
+
+  const liveSettingsWindow = Effect.gen(function* () {
+    const fromService = yield* ElectronWindow.readSettingsWindow(electronWindow);
+    if (Option.isSome(fromService) && !fromService.value.isDestroyed()) {
+      return fromService;
+    }
+    const local = yield* Ref.get(settingsWindowLocalRef);
+    if (Option.isSome(local) && !local.value.isDestroyed()) {
+      return local;
+    }
+    return Option.none<Electron.BrowserWindow>();
+  });
+
+  const contextMenuContents = new WeakSet<Electron.WebContents>();
+  const installContextMenu = (
+    ownerWindow: Electron.BrowserWindow,
+    contents: Electron.WebContents,
+    isBrowserContents = false,
+  ): void => {
+    if (contextMenuContents.has(contents)) return;
+    contextMenuContents.add(contents);
+    contents.on("context-menu", (event, params) => {
+      event.preventDefault();
+      if (contents.isDestroyed() || ownerWindow.isDestroyed()) return;
+      // Right-clicking a guest may leave native editing roles targeting the host renderer.
+      contents.focus();
+
+      const menuTemplate: Electron.MenuItemConstructorOptions[] = [];
+
+      if (isBrowserContents) {
+        menuTemplate.push(
+          {
+            label: m(msg("Reload")),
+            click: () => {
+              if (!contents.isDestroyed()) contents.reload();
+            },
+          },
+          { type: "separator" },
+        );
+      }
+
+      if (params.misspelledWord) {
+        for (const suggestion of params.dictionarySuggestions.slice(0, 5)) {
+          menuTemplate.push({
+            label: suggestion,
+            click: () => {
+              if (!contents.isDestroyed()) contents.replaceMisspelling(suggestion);
+            },
+          });
+        }
+        if (params.dictionarySuggestions.length === 0) {
+          menuTemplate.push({ label: m(msg("No suggestions")), enabled: false });
+        }
+        menuTemplate.push({ type: "separator" });
+      }
+
+      if (Option.isSome(ElectronShell.parseSafeExternalUrl(params.linkURL))) {
+        menuTemplate.push(
+          {
+            label: m(msg("Copy Link")),
+            click: () => {
+              void runPromise(electronShell.copyText(params.linkURL));
+            },
+          },
+          { type: "separator" },
+        );
+      }
+
+      const mailtoAddress = parseMailtoAddress(params.linkURL);
+      if (Option.isSome(mailtoAddress)) {
+        menuTemplate.push(
+          {
+            label: m(msg("Copy Email Address")),
+            click: () => {
+              void runPromise(electronShell.copyText(mailtoAddress.value));
+            },
+          },
+          { type: "separator" },
+        );
+      }
+
+      if (params.mediaType === "image") {
+        menuTemplate.push({
+          label: m(msg("Copy Image")),
+          click: () => {
+            void runPromise(
+              Effect.tryPromise({
+                try: () => copyContextMenuImage(contents, params),
+                catch: (cause) => new ContextMenuImageCopyError({ cause }),
+              }).pipe(Effect.catch(() => logWindowWarning("failed to copy context-menu image"))),
+            );
+          },
+        });
+        menuTemplate.push({ type: "separator" });
+      }
+
+      menuTemplate.push(
+        {
+          role: "cut",
+          label: m(msg("Cut", { $context: "Edit menu item" })),
+          enabled: params.editFlags.canCut,
+        },
+        {
+          role: "copy",
+          label: m(msg("Copy", { $context: "Edit menu item" })),
+          enabled: params.editFlags.canCopy,
+        },
+        {
+          role: "paste",
+          label: m(msg("Paste", { $context: "Edit menu item" })),
+          enabled: params.editFlags.canPaste,
+        },
+        {
+          role: "selectAll",
+          label: m(msg("Select All", { $context: "Edit menu item" })),
+          enabled: params.editFlags.canSelectAll,
+        },
+      );
+
+      void runPromise(
+        electronMenu.popupTemplate({
+          window: ownerWindow,
+          template: menuTemplate,
+          ...(params.frame ? { frame: params.frame } : {}),
+        }),
+      );
+    });
+    contents.on("did-create-window", (popup) => {
+      installContextMenu(popup, popup.webContents, isBrowserContents);
+    });
+  };
 
   const dismissConnectingSplash = Effect.gen(function* () {
     const splash = yield* Ref.getAndSet(splashWindowRef, Option.none());
@@ -445,23 +661,27 @@ export const make = Effect.gen(function* () {
   const zoomWindow = Effect.fn("desktop.window.zoomWindow")(function* (
     window: Electron.BrowserWindow,
     direction: MainWindowZoomDirection,
+    macosTopbarHeight = MACOS_WORKSPACE_TOPBAR_HEIGHT,
   ) {
     const webContents = window.webContents;
     webContents.setZoomLevel(
       direction === "reset" ? 0 : webContents.getZoomLevel() + (direction === "in" ? 0.5 : -0.5),
     );
-    if (environment.platform === "darwin") syncMacosWindowButtons(window);
+    if (environment.platform === "darwin") syncMacosWindowButtons(window, macosTopbarHeight);
     // App zoom propagates to guests; restore each preview's own zoom.
     yield* previewManager.reapplyZoom();
   });
 
-  const createWindow = Effect.fn("desktop.window.createWindow")(function* (): Effect.fn.Return<
-    Option.Option<Electron.BrowserWindow>,
-    DesktopWindowError
-  > {
+  const createWindow = Effect.fn("desktop.window.createWindow")(function* (
+    initialHref?: string,
+  ): Effect.fn.Return<Option.Option<Electron.BrowserWindow>, DesktopWindowError> {
     if (yield* Ref.get(desktopState.quitting)) return Option.none();
     yield* previewManager.getBrowserSession();
     const applicationUrl = getDesktopUrl(environment.isDevelopment);
+    const initialApplicationUrl =
+      initialHref !== undefined && initialHref.trim() !== ""
+        ? buildDesktopRouteUrl(applicationUrl, initialHref.trim())
+        : applicationUrl;
     const iconPaths = yield* assets.iconPaths;
     const iconOption = getIconOption(iconPaths, environment.platform);
     const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
@@ -660,124 +880,6 @@ export const make = Effect.gen(function* () {
       }
     });
 
-    const contextMenuContents = new WeakSet<Electron.WebContents>();
-    const installContextMenu = (
-      ownerWindow: Electron.BrowserWindow,
-      contents: Electron.WebContents,
-      isBrowserContents = false,
-    ): void => {
-      if (contextMenuContents.has(contents)) return;
-      contextMenuContents.add(contents);
-      contents.on("context-menu", (event, params) => {
-        event.preventDefault();
-        if (contents.isDestroyed() || ownerWindow.isDestroyed()) return;
-        // Right-clicking a guest may leave native editing roles targeting the host renderer.
-        contents.focus();
-
-        const menuTemplate: Electron.MenuItemConstructorOptions[] = [];
-
-        if (isBrowserContents) {
-          menuTemplate.push(
-            {
-              label: m(msg("Reload")),
-              click: () => {
-                if (!contents.isDestroyed()) contents.reload();
-              },
-            },
-            { type: "separator" },
-          );
-        }
-
-        if (params.misspelledWord) {
-          for (const suggestion of params.dictionarySuggestions.slice(0, 5)) {
-            menuTemplate.push({
-              label: suggestion,
-              click: () => {
-                if (!contents.isDestroyed()) contents.replaceMisspelling(suggestion);
-              },
-            });
-          }
-          if (params.dictionarySuggestions.length === 0) {
-            menuTemplate.push({ label: m(msg("No suggestions")), enabled: false });
-          }
-          menuTemplate.push({ type: "separator" });
-        }
-
-        if (Option.isSome(ElectronShell.parseSafeExternalUrl(params.linkURL))) {
-          menuTemplate.push(
-            {
-              label: m(msg("Copy Link")),
-              click: () => {
-                void runPromise(electronShell.copyText(params.linkURL));
-              },
-            },
-            { type: "separator" },
-          );
-        }
-
-        const mailtoAddress = parseMailtoAddress(params.linkURL);
-        if (Option.isSome(mailtoAddress)) {
-          menuTemplate.push(
-            {
-              label: m(msg("Copy Email Address")),
-              click: () => {
-                void runPromise(electronShell.copyText(mailtoAddress.value));
-              },
-            },
-            { type: "separator" },
-          );
-        }
-
-        if (params.mediaType === "image") {
-          menuTemplate.push({
-            label: m(msg("Copy Image")),
-            click: () => {
-              void runPromise(
-                Effect.tryPromise({
-                  try: () => copyContextMenuImage(contents, params),
-                  catch: (cause) => new ContextMenuImageCopyError({ cause }),
-                }).pipe(Effect.catch(() => logWindowWarning("failed to copy context-menu image"))),
-              );
-            },
-          });
-          menuTemplate.push({ type: "separator" });
-        }
-
-        menuTemplate.push(
-          {
-            role: "cut",
-            label: m(msg("Cut", { $context: "Edit menu item" })),
-            enabled: params.editFlags.canCut,
-          },
-          {
-            role: "copy",
-            label: m(msg("Copy", { $context: "Edit menu item" })),
-            enabled: params.editFlags.canCopy,
-          },
-          {
-            role: "paste",
-            label: m(msg("Paste", { $context: "Edit menu item" })),
-            enabled: params.editFlags.canPaste,
-          },
-          {
-            role: "selectAll",
-            label: m(msg("Select All", { $context: "Edit menu item" })),
-            enabled: params.editFlags.canSelectAll,
-          },
-        );
-
-        void runPromise(
-          electronMenu.popupTemplate({
-            window: ownerWindow,
-            template: menuTemplate,
-            ...(params.frame ? { frame: params.frame } : {}),
-          }),
-        );
-      });
-      contents.on("did-create-window", (popup) => {
-        installContextMenu(popup, popup.webContents, isBrowserContents);
-      });
-    };
     installContextMenu(window, window.webContents);
     window.webContents.on("did-attach-webview", (_event, contents) => {
       installContextMenu(window, contents, true);
@@ -913,7 +1015,7 @@ export const make = Effect.gen(function* () {
       if (window.isDestroyed()) {
         return;
       }
-      void window.loadURL(applicationUrl).catch(() => undefined);
+      void window.loadURL(initialApplicationUrl).catch(() => undefined);
     };
     const scheduleDevelopmentLoadRetry = () => {
       if (developmentLoadRetryFiber !== undefined || window.isDestroyed()) {
@@ -1055,21 +1157,9 @@ export const make = Effect.gen(function* () {
       void runPromise(revealWhenReady);
     });
 
-    // Desktop IPC only answers the main window, so register it before its renderer can call in.
+    // Desktop IPC only answers registered app windows, so register before its renderer can call in.
     yield* electronWindow.setMain(window);
-    remoteRequestHeaderOwner = window;
-    const detachRemoteRequestHeaders = installMainWindowRemoteRequestHeaderPolicy(
-      window.webContents.session,
-      {
-        desktopOrigin: getDesktopOrigin(environment.isDevelopment),
-        mainWebContentsId: window.webContents.id,
-        clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
-        devServerOrigin: Option.getOrUndefined(
-          Option.map(environment.devServerUrl, (url) => url.origin),
-        ),
-        isDevelopment: environment.isDevelopment,
-      },
-    );
+    ensureRemoteRequestHeaderPolicy(window);
     loadApplication();
     if (environment.isDevelopment) {
       window.webContents.openDevTools({ mode: "detach" });
@@ -1079,33 +1169,61 @@ export const make = Effect.gen(function* () {
       if (!backendHasStarted) mainClosedDuringStartup = true;
       clearDevelopmentLoadRetry();
       clearBoundsPersist();
-      if (remoteRequestHeaderOwner === window) {
-        remoteRequestHeaderOwner = null;
-        detachRemoteRequestHeaders();
-      }
-      void runPromise(electronWindow.clearMain(Option.some(window)));
+      releaseRemoteRequestHeaderPolicy(window);
+      void runPromise(
+        electronWindow.clearMain(Option.some(window)).pipe(
+          Effect.andThen(
+            environment.platform === "darwin"
+              ? Effect.void
+              : liveSettingsWindow.pipe(
+                  Effect.tap(
+                    Option.match({
+                      onNone: () => Effect.void,
+                      onSome: (settingsWindow) =>
+                        Effect.sync(() => {
+                          if (!settingsWindow.isDestroyed()) settingsWindow.close();
+                        }),
+                    }),
+                  ),
+                  Effect.asVoid,
+                ),
+          ),
+        ),
+      );
     });
 
     return Option.some(window);
   });
 
-  const createMain = Effect.gen(function* () {
-    const window = yield* createWindow();
+  const createMainWithHref = Effect.fn("desktop.window.createMain")(function* (
+    initialHref?: string,
+  ) {
+    const window = yield* createWindow(initialHref);
     if (Option.isSome(window)) {
       mainClosedDuringStartup = false;
       yield* logWindowInfo("main window created");
     }
     return window;
-  }).pipe(Effect.withSpan("desktop.window.createMain"));
+  });
 
-  const ensureMain = Effect.gen(function* () {
-    if (yield* Ref.get(desktopState.quitting)) return Option.none<Electron.BrowserWindow>();
-    const existingWindow = yield* electronWindow.main;
-    if (Option.isSome(existingWindow)) {
-      return existingWindow;
-    }
-    return yield* createMain;
-  }).pipe(mainWindowMutex.withPermits(1), Effect.withSpan("desktop.window.ensureMain"));
+  const createMain = createMainWithHref();
+
+  const ensureMainWithHref = Effect.fn("desktop.window.ensureMain")(function* (
+    initialHref?: string,
+  ) {
+    return yield* mainWindowMutex.withPermits(1)(
+      Effect.gen(function* () {
+        if (yield* Ref.get(desktopState.quitting)) return Option.none<Electron.BrowserWindow>();
+        const existingWindow = yield* electronWindow.main;
+        if (Option.isSome(existingWindow)) {
+          return existingWindow;
+        }
+        return yield* createMainWithHref(initialHref);
+      }),
+    );
+  });
+
+  const ensureMain = ensureMainWithHref();
 
   const requireWindow = (window: Option.Option<Electron.BrowserWindow>) =>
     Option.match(window, {
@@ -1122,6 +1240,424 @@ export const make = Effect.gen(function* () {
   const waitingForBackend = Effect.gen(function* () {
     if (yield* Ref.get(backendReadyRef)) return false;
     return (yield* desktopSettings.get).localEnvironmentEnabled;
+  });
+
+  const sendWindowNavigate = (targetWindow: Electron.BrowserWindow, href: string) =>
+    Effect.sync(() => {
+      if (targetWindow.isDestroyed()) return;
+      if (targetWindow.webContents.isLoadingMainFrame()) {
+        const applicationUrl = getDesktopUrl(environment.isDevelopment);
+        void targetWindow
+          .loadURL(buildDesktopRouteUrl(applicationUrl, href))
+          .catch(() => undefined);
+        return;
+      }
+      targetWindow.webContents.send(WINDOW_NAVIGATE_CHANNEL, href);
+    });
+
+  const createSettingsWindow = Effect.fn("desktop.window.createSettingsWindow")(function* (
+    initialHref: string,
+  ): Effect.fn.Return<Option.Option<Electron.BrowserWindow>, DesktopWindowError> {
+    if (yield* Ref.get(desktopState.quitting)) return Option.none();
+    const applicationUrl = getDesktopUrl(environment.isDevelopment);
+    const initialSettingsUrl = buildDesktopRouteUrl(applicationUrl, initialHref);
+    const iconPaths = yield* assets.iconPaths;
+    const iconOption = getIconOption(iconPaths, environment.platform);
+    const shouldUseDarkColors = yield* electronTheme.shouldUseDarkColors;
+    const persistedSettings = yield* desktopSettings.get;
+    const persistedBounds = persistedSettings.settingsWindowBounds ?? null;
+    const displayBounds = readDisplayBoundsOrEmpty();
+    const initialBounds = resolveInitialSettingsWindowBounds(persistedBounds, displayBounds);
+    const restoredPersistedBounds = persistedBounds !== null && initialBounds === persistedBounds;
+
+    if (yield* Ref.get(desktopState.quitting)) return Option.none();
+    const window = yield* electronWindow.create(
+      {
+        ...initialBounds,
+        ...(restoredPersistedBounds ? {} : { center: true }),
+        minWidth: DesktopAppSettings.MIN_SETTINGS_WINDOW_SIZE.width,
+        minHeight: DesktopAppSettings.MIN_SETTINGS_WINDOW_SIZE.height,
+        show: false,
+        autoHideMenuBar: true,
+        ...(environment.platform === "darwin" ? { disableAutoHideCursor: true } : {}),
+        backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors),
+        ...iconOption,
+        title: environment.displayName,
+        ...getWindowTitleBarOptions(
+          shouldUseDarkColors,
+          environment.platform,
+          MACOS_SETTINGS_TOPBAR_HEIGHT,
+        ),
+        webPreferences: {
+          preload: environment.preloadPath,
+          additionalArguments: [SETTINGS_WINDOW_ARGUMENT],
+          backgroundThrottling: false,
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          webviewTag: false,
+          disableHtmlFullscreenWindowResize: true,
+        },
+      },
+      { auxiliary: true },
+    );
+
+    if (yield* Ref.get(desktopState.quitting)) {
+      if (!window.isDestroyed()) window.destroy();
+      return Option.none();
+    }
+
+    pendingSettingsReveals.set(window, Effect.void);
+    yield* rendererHistory.register(window.webContents, { surface: "settings" });
+    if (environment.platform === "darwin") {
+      window.setAutoHideCursor(false);
+    }
+
+    let boundsPersistFiber: Fiber.Fiber<void, never> | undefined;
+    let pendingBoundsPersistFiber: Fiber.Fiber<void, never> | undefined;
+    let lastPersistableBounds: DesktopAppSettings.DesktopWindowBounds | null = null;
+    const readPersistableBounds = () => {
+      if (window.isDestroyed()) return null;
+      if (window.isMinimized()) return lastPersistableBounds;
+      const bounds =
+        window.isFullScreen() || window.isMaximized()
+          ? normalBoundsOnWindowDisplay(
+              window.getNormalBounds(),
+              window.getBounds(),
+              readDisplayBoundsOrEmpty(),
+            )
+          : window.getBounds();
+      const normalized = DesktopAppSettings.normalizeSettingsWindowBounds({
+        x: Math.round(bounds.x),
+        y: Math.round(bounds.y),
+        width: Math.round(bounds.width),
+        height: Math.round(bounds.height),
+      });
+      if (normalized !== null) lastPersistableBounds = normalized;
+      return lastPersistableBounds;
+    };
+
+    const persistCurrentBounds = (): Fiber.Fiber<void, never> | undefined => {
+      const bounds = readPersistableBounds();
+      if (bounds === null || desktopSettings.setSettingsWindowBounds === undefined) {
+        return pendingBoundsPersistFiber;
+      }
+      pendingBoundsPersistFiber = runFork(
+        desktopSettings.setSettingsWindowBounds(bounds).pipe(
+          Effect.asVoid,
+          Effect.catch((error) =>
+            logWindowWarning("failed to persist settings window bounds", {
+              message: error.message,
+            }),
+          ),
+        ),
+      );
+      return pendingBoundsPersistFiber;
+    };
+
+    const clearBoundsPersist = () => {
+      if (boundsPersistFiber === undefined) return;
+      const fiber = boundsPersistFiber;
+      boundsPersistFiber = undefined;
+      runFork(Fiber.interrupt(fiber));
+    };
+
+    const scheduleBoundsPersist = () => {
+      clearBoundsPersist();
+      boundsPersistFiber = runFork(
+        Effect.sleep(MAIN_WINDOW_BOUNDS_PERSIST_DEBOUNCE_MS).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              boundsPersistFiber = undefined;
+              void persistCurrentBounds();
+            }),
+          ),
+        ),
+      );
+    };
+
+    const flushBoundsPersist = Effect.sync(() => {
+      clearBoundsPersist();
+      return persistCurrentBounds();
+    }).pipe(
+      Effect.flatMap((fiber) =>
+        fiber === undefined ? Effect.void : Fiber.join(fiber).pipe(Effect.asVoid),
+      ),
+    );
+    flushSettingsWindowBounds = flushBoundsPersist;
+
+    installContextMenu(window, window.webContents);
+    window.webContents.setWindowOpenHandler(({ url }) => {
+      if (Option.isSome(ElectronShell.parseWebExternalUrl(url))) {
+        void runPromise(electronShell.openExternal(url));
+      }
+      return { action: "deny" };
+    });
+    window.webContents.on("will-navigate", (event, url) => {
+      if (
+        isSameOriginRendererNavigation({
+          applicationUrl,
+          navigationUrl: url,
+        })
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (Option.isSome(ElectronShell.parseSafeExternalUrl(url))) {
+        void runPromise(electronShell.openExternal(url));
+      }
+    });
+
+    const quitShortcutHandler = makeQuitShortcutHandler({
+      platform: environment.platform,
+      getMode: () =>
+        runPromise(
+          Effect.map(
+            clientSettings.get,
+            Option.match({
+              onNone: () => DEFAULT_CLIENT_SETTINGS.confirmQuit,
+              onSome: (settings) => settings.confirmQuit,
+            }),
+          ),
+        ),
+      notify: (hint) => {
+        if (!window.isDestroyed()) {
+          window.webContents.send(QUIT_SHORTCUT_CHANNEL, hint);
+        }
+      },
+      concealWindow: () => concealPendingQuitWindow(window),
+      quit: () => {
+        void runPromise(electronApp.quit);
+      },
+    });
+
+    window.webContents.on("before-input-event", (event, input) => {
+      quitShortcutHandler(event, input);
+      if (window.isDestroyed()) return;
+      const modifier = environment.platform === "darwin" ? input.meta : input.control;
+      if (modifier && !input.alt && !input.shift && input.key.toLowerCase() === "w") {
+        window.webContents.setIgnoreMenuShortcuts(true);
+        if (input.type === "keyDown") {
+          event.preventDefault();
+          if (!input.isAutoRepeat) window.close();
+        }
+      } else {
+        window.webContents.setIgnoreMenuShortcuts(false);
+      }
+    });
+
+    window.webContents.on("input-event", (_event, input) => {
+      if (window.isDestroyed()) return;
+      if (input.type === "gestureScrollBegin") {
+        window.webContents.send(TRACKPAD_SCROLL_BEGIN_CHANNEL);
+      } else if (input.type === "gestureScrollEnd") {
+        window.webContents.send(TRACKPAD_SCROLL_END_CHANNEL);
+      }
+    });
+
+    window.webContents.on("zoom-changed", (_event, direction) => {
+      if (window.isDestroyed()) return;
+      runFork(zoomWindow(window, direction, MACOS_SETTINGS_TOPBAR_HEIGHT));
+    });
+
+    window.on("page-title-updated", (event, title) => {
+      if (title.trim() !== "") return;
+      event.preventDefault();
+      window.setTitle(environment.displayName);
+    });
+    window.on("resize", scheduleBoundsPersist);
+    window.on("move", scheduleBoundsPersist);
+    window.on("close", () => {
+      runFork(flushBoundsPersist);
+    });
+
+    if (environment.platform === "darwin") {
+      window.on("enter-full-screen", () => {
+        window.webContents.send(WINDOW_FULLSCREEN_STATE_CHANNEL, true);
+      });
+      window.on("leave-full-screen", () => {
+        syncMacosWindowButtons(window, MACOS_SETTINGS_TOPBAR_HEIGHT);
+        window.webContents.send(WINDOW_FULLSCREEN_STATE_CHANNEL, false);
+      });
+    }
+
+    let developmentLoadRetryIndex = 0;
+    let developmentLoadRetryFiber: Fiber.Fiber<void, never> | undefined;
+    const clearDevelopmentLoadRetry = () => {
+      if (developmentLoadRetryFiber === undefined) return;
+      const retryFiber = developmentLoadRetryFiber;
+      developmentLoadRetryFiber = undefined;
+      runFork(Fiber.interrupt(retryFiber));
+    };
+    let currentSettingsUrl = initialSettingsUrl;
+    const loadSettingsApplication = () => {
+      if (window.isDestroyed()) return;
+      void window.loadURL(currentSettingsUrl).catch(() => undefined);
+    };
+
+    window.webContents.on("did-finish-load", () => {
+      if (
+        environment.isDevelopment &&
+        !isSameOriginRendererNavigation({
+          applicationUrl,
+          navigationUrl: window.webContents.getURL(),
+        })
+      ) {
+        return;
+      }
+      clearDevelopmentLoadRetry();
+      developmentLoadRetryIndex = 0;
+      if (environment.platform === "darwin") {
+        syncMacosWindowButtons(window, MACOS_SETTINGS_TOPBAR_HEIGHT);
+      }
+    });
+    window.webContents.on(
+      "did-fail-load",
+      (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) return;
+        let retryInMs: number | undefined;
+        if (
+          environment.isDevelopment &&
+          isRetryableDevelopmentRendererLoadFailure({
+            applicationUrl,
+            errorCode,
+            isMainFrame,
+            validatedUrl: validatedURL,
+          }) &&
+          developmentLoadRetryFiber === undefined &&
+          !window.isDestroyed()
+        ) {
+          const retryIndex = Math.min(
+            developmentLoadRetryIndex,
+            DEVELOPMENT_LOAD_RETRY_DELAYS_MS.length - 1,
+          );
+          retryInMs = DEVELOPMENT_LOAD_RETRY_DELAYS_MS[retryIndex] ?? 2_000;
+          developmentLoadRetryIndex += 1;
+          developmentLoadRetryFiber = runFork(
+            Effect.sleep(retryInMs).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  developmentLoadRetryFiber = undefined;
+                  if (!window.isDestroyed()) loadSettingsApplication();
+                }),
+              ),
+            ),
+          );
+        }
+        void runPromise(
+          logWindowWarning("settings window failed to load", {
+            errorCode,
+            errorDescription,
+            url: validatedURL,
+            ...(retryInMs === undefined ? {} : { retryInMs }),
+          }),
+        );
+      },
+    );
+
+    const revealSubscribers: RevealSubscription[] = [(fire) => window.once("ready-to-show", fire)];
+    if (environment.platform === "linux") {
+      revealSubscribers.push((fire) => window.webContents.once("did-finish-load", fire));
+    }
+    let rendererReady = false;
+    let firstRevealComplete = false;
+    const revealWhenReady = Effect.gen(function* () {
+      if (
+        !rendererReady ||
+        firstRevealComplete ||
+        window.isDestroyed() ||
+        (yield* Ref.get(desktopState.quitting))
+      ) {
+        return;
+      }
+      firstRevealComplete = true;
+      pendingSettingsReveals.delete(window);
+      window.webContents.setBackgroundThrottling(true);
+      yield* electronWindow.reveal(window);
+    });
+    pendingSettingsReveals.set(window, revealWhenReady);
+    bindFirstRevealTrigger(revealSubscribers, () => {
+      rendererReady = true;
+      void runPromise(revealWhenReady);
+    });
+
+    yield* Ref.set(settingsWindowLocalRef, Option.some(window));
+    if (electronWindow.setSettings !== undefined) {
+      yield* electronWindow.setSettings(window).pipe(Effect.ignoreCause);
+    }
+    ensureRemoteRequestHeaderPolicy(window);
+    loadSettingsApplication();
+
+    window.on("closed", () => {
+      clearDevelopmentLoadRetry();
+      clearBoundsPersist();
+      flushSettingsWindowBounds = Effect.void;
+      releaseRemoteRequestHeaderPolicy(window);
+      void runPromise(
+        Ref.update(settingsWindowLocalRef, (current) =>
+          Option.isSome(current) && current.value === window ? Option.none() : current,
+        ).pipe(
+          Effect.andThen(
+            electronWindow.clearSettings === undefined
+              ? Effect.void
+              : electronWindow.clearSettings(Option.some(window)).pipe(Effect.ignoreCause),
+          ),
+        ),
+      );
+    });
+
+    yield* logWindowInfo("settings window created", { href: initialHref });
+    return Option.some(window);
+  });
+
+  const openSettings = Effect.fn("desktop.window.openSettings")(function* (rawHref?: string) {
+    if (yield* Ref.get(desktopState.quitting)) return;
+    if (yield* waitingForBackend) return;
+    const trimmed = rawHref?.trim() ?? "";
+    const hasSpecificTarget = trimmed !== "" && trimmed !== "/settings";
+    const normalizedHref = normalizeSettingsHref(rawHref);
+
+    const existing = yield* liveSettingsWindow;
+    if (Option.isSome(existing)) {
+      if (hasSpecificTarget) {
+        yield* sendWindowNavigate(existing.value, normalizedHref);
+      }
+      yield* revealSettings(existing.value);
+      return;
+    }
+
+    yield* Effect.gen(function* () {
+      const rechecked = yield* liveSettingsWindow;
+      if (Option.isSome(rechecked)) {
+        if (hasSpecificTarget) {
+          yield* sendWindowNavigate(rechecked.value, normalizedHref);
+        }
+        yield* revealSettings(rechecked.value);
+        return;
+      }
+      const created = yield* createSettingsWindow(normalizedHref);
+      if (Option.isSome(created)) {
+        yield* revealSettings(created.value);
+      }
+    }).pipe(settingsWindowMutex.withPermits(1));
+  });
+
+  const openInMain = Effect.fn("desktop.window.openInMain")(function* (href: string) {
+    if (yield* Ref.get(desktopState.quitting)) return;
+    if (yield* waitingForBackend) return;
+    const trimmed = href.trim();
+    const existingMain = yield* electronWindow.main;
+    if (Option.isSome(existingMain)) {
+      yield* revealMain(existingMain.value);
+      if (trimmed !== "") {
+        yield* sendWindowNavigate(existingMain.value, trimmed);
+      }
+      return;
+    }
+    const createdMain = yield* ensureMainWithHref(trimmed !== "" ? trimmed : undefined).pipe(
+      Effect.flatMap(requireWindow),
+    );
+    yield* revealMain(createdMain);
   });
 
   const createMainIfBackendReady = Effect.gen(function* () {
@@ -1230,6 +1766,8 @@ export const make = Effect.gen(function* () {
     createMain: createMain.pipe(Effect.flatMap(requireWindow)),
     ensureMain: ensureMain.pipe(Effect.flatMap(requireWindow)),
     revealOrCreateMain,
+    openSettings,
+    openInMain,
     prepareCaptureReveal: Effect.gen(function* () {
       const existingWindow = yield* currentMainWindow;
       if (Option.isSome(existingWindow) && !pendingMainReveals.has(existingWindow.value)) {
@@ -1268,9 +1806,9 @@ export const make = Effect.gen(function* () {
     handleBackendNotReady: Ref.set(backendReadyRef, false).pipe(
       Effect.withSpan("desktop.window.handleBackendNotReady"),
     ),
-    flushMainWindowBounds: Effect.suspend(() => flushMainWindowBounds).pipe(
-      Effect.withSpan("desktop.window.flushMainWindowBounds"),
-    ),
+    flushMainWindowBounds: Effect.suspend(() =>
+      Effect.all([flushMainWindowBounds, flushSettingsWindowBounds], { discard: true }),
+    ).pipe(Effect.withSpan("desktop.window.flushMainWindowBounds")),
     dispatchMenuAction: Effect.fn("desktop.window.dispatchMenuAction")(function* (action, options) {
       yield* Effect.annotateCurrentSpan({ action });
       yield* dispatchRendererEvent(MENU_ACTION_CHANNEL, action, options);
@@ -1286,6 +1824,14 @@ export const make = Effect.gen(function* () {
     }),
     zoomMain: Effect.fn("desktop.window.zoomMain")(function* (direction) {
       yield* Effect.annotateCurrentSpan({ direction });
+      const settings = yield* liveSettingsWindow;
+      if (Option.isSome(settings)) {
+        const focused = yield* electronWindow.focusedMainOrFirst;
+        if (Option.isSome(focused) && focused.value === settings.value) {
+          yield* zoomWindow(settings.value, direction, MACOS_SETTINGS_TOPBAR_HEIGHT);
+          return;
+        }
+      }
       const window = yield* electronWindow.main;
       if (Option.isNone(window) || window.value.isDestroyed()) {
         return;
@@ -1294,8 +1840,16 @@ export const make = Effect.gen(function* () {
     }),
     runMainContentsCommand: Effect.fn("desktop.window.runMainContentsCommand")(function* (command) {
       yield* Effect.annotateCurrentSpan({ command });
+      const settings = yield* liveSettingsWindow;
+      let targetWindow: Option.Option<Electron.BrowserWindow> = Option.none();
+      if (Option.isSome(settings)) {
+        const focused = yield* electronWindow.focusedMainOrFirst;
+        if (Option.isSome(focused) && focused.value === settings.value) {
+          targetWindow = settings;
+        }
+      }
       // A focused OAuth popup must not receive the app's Reload command.
-      const window = yield* electronWindow.main;
+      const window = Option.isSome(targetWindow) ? targetWindow : yield* electronWindow.main;
       if (Option.isNone(window) || window.value.isDestroyed()) return;
       const webContents = window.value.webContents;
       if (command === "reload") webContents.reload();

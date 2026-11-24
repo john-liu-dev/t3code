@@ -17,7 +17,7 @@ export const receiveProviderAuthCallback = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.RECEIVE_PROVIDER_AUTH_CALLBACK_CHANNEL,
   payload: Request,
   result: Schema.String,
-  handler: Effect.fn("desktop.ipc.providerAuth.receive")(function* (authorizationUrl) {
+  handler: Effect.fn("desktop.ipc.providerAuth.receive")(function* (authorizationUrl, event) {
     const shell = yield* ElectronShell.ElectronShell;
     const windows = yield* ElectronWindow.ElectronWindow;
     const context = yield* Effect.context<ElectronShell.ElectronShell>();
@@ -36,7 +36,11 @@ export const receiveProviderAuthCallback = DesktopIpc.makeIpcMethod({
             "Could not receive ChatGPT sign-in on this computer. Try again or paste the redirect URL.",
         }),
     });
-    const window = yield* windows.currentMainOrFirst;
+    const senderWindow =
+      event === undefined
+        ? Option.none()
+        : yield* ElectronWindow.resolveAppWindowForWebContentsId(windows, event.sender.id);
+    const window = Option.isSome(senderWindow) ? senderWindow : yield* windows.currentMainOrFirst;
     if (Option.isSome(window)) yield* windows.reveal(window.value);
     return callbackUrl;
   }),

@@ -116,13 +116,21 @@ export class ElectronWindow extends Context.Service<
       behavior?: { readonly auxiliary?: boolean },
     ) => Effect.Effect<Electron.BrowserWindow, ElectronWindowCreateError>;
     readonly main: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
+    readonly settings?: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly currentMainOrFirst: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly focusedMainOrFirst: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly setMain: (window: Electron.BrowserWindow) => Effect.Effect<void>;
     readonly clearMain: (window: Option.Option<Electron.BrowserWindow>) => Effect.Effect<void>;
+    readonly setSettings?: (window: Electron.BrowserWindow) => Effect.Effect<void>;
+    readonly clearSettings?: (window: Option.Option<Electron.BrowserWindow>) => Effect.Effect<void>;
     readonly prepareReveal: (window: Electron.BrowserWindow) => Effect.Effect<boolean>;
     readonly reveal: (window: Electron.BrowserWindow) => Effect.Effect<void>;
     readonly sendAll: (channel: string, ...args: readonly unknown[]) => Effect.Effect<void>;
+    readonly sendOthers?: (
+      excludeWebContentsId: number,
+      channel: string,
+      ...args: readonly unknown[]
+    ) => Effect.Effect<void>;
     readonly destroyAll: Effect.Effect<void>;
     readonly syncAllAppearance: <E, R>(
       sync: (
@@ -147,6 +155,7 @@ export const make = Effect.gen(function* () {
   const captureRevealWindows = new Set<number>();
   yield* Effect.addFinalizer(() => Effect.sync(() => windowsForegroundFocus?.close()));
   const mainWindowRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+  const settingsWindowRef = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
   const auxiliaryWindows = new WeakSet<Electron.BrowserWindow>();
   const titleBarOverlayWindows = new WeakSet<Electron.BrowserWindow>();
 
@@ -181,6 +190,14 @@ export const make = Effect.gen(function* () {
       return Option.none<Electron.BrowserWindow>();
     }
     return main;
+  });
+
+  const liveSettings = Effect.gen(function* () {
+    const settings = yield* Ref.get(settingsWindowRef);
+    if (Option.isNone(settings) || (yield* isWindowDestroyed(settings.value))) {
+      return Option.none<Electron.BrowserWindow>();
+    }
+    return settings;
   });
 
   const currentMainOrFirst = Effect.gen(function* () {
@@ -254,6 +271,7 @@ export const make = Effect.gen(function* () {
       });
     }),
     main: liveMain,
+    settings: liveSettings,
     currentMainOrFirst,
     focusedMainOrFirst,
     setMain: Effect.fn("ElectronWindow.setMain")(function (window) {
@@ -261,6 +279,20 @@ export const make = Effect.gen(function* () {
     }),
     clearMain: Effect.fn("ElectronWindow.clearMain")(function (window) {
       return Ref.update(mainWindowRef, (current) => {
+        if (Option.isNone(current)) {
+          return current;
+        }
+        if (Option.isSome(window) && current.value !== window.value) {
+          return current;
+        }
+        return Option.none();
+      });
+    }),
+    setSettings: Effect.fn("ElectronWindow.setSettings")(function (window) {
+      return Ref.set(settingsWindowRef, Option.some(window));
+    }),
+    clearSettings: Effect.fn("ElectronWindow.clearSettings")(function (window) {
+      return Ref.update(settingsWindowRef, (current) => {
         if (Option.isNone(current)) {
           return current;
         }
@@ -365,6 +397,24 @@ export const make = Effect.gen(function* () {
           }).pipe(Effect.orDie);
         }
       }),
+    sendOthers: Effect.fnUntraced(function* (excludeWebContentsId, channel, ...args) {
+      for (const window of yield* listWindows) {
+        if ((yield* isWindowDestroyed(window)) || window.webContents.id === excludeWebContentsId) {
+          continue;
+        }
+        yield* Effect.try({
+          try: () => window.webContents.send(channel, ...args),
+          catch: (cause) =>
+            new ElectronWindowOperationError({
+              operation: "send-window-message",
+              platform,
+              windowId: window.id,
+              channel,
+              cause,
+            }),
+        }).pipe(Effect.orDie);
+      }
+    }),
     destroyAll: Effect.gen(function* () {
       let firstFailure: Cause.Cause<never> | undefined;
       for (const window of yield* listWindows) {
@@ -407,3 +457,22 @@ export const make = Effect.gen(function* () {
 });
 
 export const layer = Layer.effect(ElectronWindow, make);
+
+export const readSettingsWindow = (
+  electronWindow: ElectronWindow["Service"],
+): Effect.Effect<Option.Option<Electron.BrowserWindow>> =>
+  (electronWindow.settings ?? Effect.succeedNone).pipe(Effect.catchCause(() => Effect.succeedNone));
+
+export const resolveAppWindowForWebContentsId = Effect.fn(
+  "ElectronWindow.resolveAppWindowForWebContentsId",
+)(function* (electronWindow: ElectronWindow["Service"], webContentsId: number) {
+  const main = yield* electronWindow.main;
+  if (Option.isSome(main) && main.value.webContents.id === webContentsId) {
+    return main;
+  }
+  const settings = yield* readSettingsWindow(electronWindow);
+  if (Option.isSome(settings) && settings.value.webContents.id === webContentsId) {
+    return settings;
+  }
+  return Option.none<Electron.BrowserWindow>();
+});

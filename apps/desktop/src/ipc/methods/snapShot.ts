@@ -33,7 +33,24 @@ class SnapShotIpcUnauthorizedSenderError extends Schema.TaggedError<SnapShotIpcU
   }
 }
 
-const ensureTrustedSnapShotSender = Effect.fn("desktop.ipc.snapShot.ensureTrustedSender")(
+const ensureTrustedSnapShotAppSender = Effect.fn("desktop.ipc.snapShot.ensureTrustedAppSender")(
+  function* (event: DesktopIpc.DesktopIpcInvokeEvent | undefined) {
+    if (event === undefined) {
+      return yield* new SnapShotIpcUnauthorizedSenderError();
+    }
+    const electronWindow = yield* ElectronWindow.ElectronWindow;
+    const window = yield* ElectronWindow.resolveAppWindowForWebContentsId(
+      electronWindow,
+      event.sender.id,
+    );
+    if (Option.isNone(window)) {
+      return yield* new SnapShotIpcUnauthorizedSenderError();
+    }
+    return window.value;
+  },
+);
+
+const ensureTrustedMainSnapShotSender = Effect.fn("desktop.ipc.snapShot.ensureTrustedMainSender")(
   function* (event: DesktopIpc.DesktopIpcInvokeEvent | undefined) {
     const main = yield* (yield* ElectronWindow.ElectronWindow).main;
     if (
@@ -89,7 +106,7 @@ export const requestSnapShotPermissions = DesktopIpc.makeIpcMethod({
   result: Schema.Void,
   handler: Effect.fn("desktop.ipc.snapShot.requestPermissions")(
     function* (includeAccessibility, event) {
-      yield* ensureTrustedSnapShotSender(event);
+      yield* ensureTrustedSnapShotAppSender(event);
       yield* (yield* DesktopSnapShot.DesktopSnapShot).requestPermissions(includeAccessibility);
     },
   ),
@@ -100,7 +117,7 @@ export const setupSnapShot = DesktopIpc.makeIpcMethod({
   payload: DesktopSnapShotSetupAction,
   result: Schema.Void,
   handler: Effect.fn("desktop.ipc.snapShot.setup")(function* (action, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedSnapShotAppSender(event);
     yield* (yield* DesktopSnapShot.DesktopSnapShot).setup(action);
   }),
 });
@@ -110,7 +127,7 @@ export const previewSnapShotConfig = DesktopIpc.makeIpcMethod({
   payload: DesktopCaptureConfigRequest,
   result: Schema.NullOr(DesktopCaptureConfigPreview),
   handler: Effect.fn("desktop.ipc.snapShot.previewConfig")(function* (request, event) {
-    const window = yield* ensureTrustedSnapShotSender(event);
+    const window = yield* ensureTrustedSnapShotAppSender(event);
     const capture = yield* DesktopSnapShot.DesktopSnapShot;
     let selectedPath: string | undefined;
     if (request.chooseFile) {
@@ -138,7 +155,7 @@ export const applySnapShotConfig = DesktopIpc.makeIpcMethod({
   payload: DesktopSnapShotId,
   result: DesktopCaptureConfigApplied,
   handler: Effect.fn("desktop.ipc.snapShot.applyConfig")(function* (id, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedSnapShotAppSender(event);
     return yield* (yield* DesktopSnapShot.DesktopSnapShot).applyConfig(id);
   }),
 });
@@ -148,7 +165,7 @@ export const checkSnapShotShortcut = DesktopIpc.makeIpcMethod({
   payload: SnapShotShortcut,
   result: DesktopSnapShotShortcutAvailability,
   handler: Effect.fn("desktop.ipc.snapShot.checkShortcut")(function* (shortcut, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedSnapShotAppSender(event);
     return yield* (yield* DesktopSnapShot.DesktopSnapShot).checkShortcut(shortcut);
   }),
 });
@@ -158,7 +175,7 @@ export const setSnapShotShortcutSuppressed = DesktopIpc.makeIpcMethod({
   payload: Schema.Boolean,
   result: Schema.Void,
   handler: Effect.fn("desktop.ipc.snapShot.setShortcutSuppressed")(function* (suppressed, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedSnapShotAppSender(event);
     yield* (yield* DesktopSnapShot.DesktopSnapShot).setShortcutSuppressed(suppressed);
   }),
 });
@@ -168,7 +185,7 @@ export const listPendingSnapShots = DesktopIpc.makeIpcMethod({
   payload: Schema.Void,
   result: Schema.Array(DesktopPendingSnapShot),
   handler: Effect.fn("desktop.ipc.snapShot.listPending")(function* (_, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedMainSnapShotSender(event);
     return yield* (yield* DesktopSnapShot.DesktopSnapShot).listPending;
   }),
 });
@@ -178,7 +195,7 @@ export const readSnapShot = DesktopIpc.makeIpcMethod({
   payload: DesktopSnapShotId,
   result: DesktopSnapShotSchema,
   handler: Effect.fn("desktop.ipc.snapShot.read")(function* (id, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedMainSnapShotSender(event);
     return yield* (yield* DesktopSnapShot.DesktopSnapShot).read(id);
   }),
 });
@@ -189,7 +206,7 @@ export const setSnapShotAnimationDestination = DesktopIpc.makeIpcMethod({
   result: Schema.Void,
   handler: Effect.fn("desktop.ipc.snapShot.setAnimationDestination")(
     function* (destination, event) {
-      const window = yield* ensureTrustedSnapShotSender(event);
+      const window = yield* ensureTrustedMainSnapShotSender(event);
       if (
         destination.viewportFrame.width <= 0 ||
         destination.viewportFrame.height <= 0 ||
@@ -225,7 +242,7 @@ export const dismissSnapShotAnimation = DesktopIpc.makeIpcMethod({
   payload: DesktopSnapShotId,
   result: Schema.Void,
   handler: Effect.fn("desktop.ipc.snapShot.dismissAnimation")(function* (id, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedMainSnapShotSender(event);
     yield* (yield* DesktopSnapShot.DesktopSnapShot).dismissAnimation(id);
   }),
 });
@@ -235,7 +252,7 @@ export const acknowledgeSnapShot = DesktopIpc.makeIpcMethod({
   payload: DesktopSnapShotId,
   result: Schema.Void,
   handler: Effect.fn("desktop.ipc.snapShot.acknowledge")(function* (id, event) {
-    yield* ensureTrustedSnapShotSender(event);
+    yield* ensureTrustedMainSnapShotSender(event);
     yield* (yield* DesktopSnapShot.DesktopSnapShot).acknowledge(id);
   }),
 });
