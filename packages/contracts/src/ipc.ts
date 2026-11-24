@@ -1109,6 +1109,60 @@ export const DesktopAppleSpeechTranscribeInputSchema = Schema.Struct({
 export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
 export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
 
+export const DesktopLocalUpgradeTargetSchema = Schema.Literals(["custom", "official", "rollback"]);
+export type DesktopLocalUpgradeTarget = typeof DesktopLocalUpgradeTargetSchema.Type;
+
+export const DesktopLocalUpgradeLocalBuildSchema = Schema.Struct({
+  kind: Schema.Literals(["zip", "dmg"]),
+  path: Schema.String,
+  version: Schema.NullOr(Schema.String),
+  modifiedAt: Schema.NullOr(Schema.String),
+});
+
+export const DesktopLocalUpgradeOfficialReleaseSchema = Schema.Struct({
+  tag: Schema.String,
+  version: Schema.String,
+  publishedAt: Schema.String,
+  assetKind: Schema.Literals(["zip", "dmg"]),
+  assetName: Schema.String,
+  assetUrl: Schema.String,
+});
+
+export const DesktopLocalUpgradeStatusSchema = Schema.Struct({
+  installedKind: Schema.Literals(["official", "custom", "missing"]),
+  installedVersion: Schema.NullOr(Schema.String),
+  hasOfficialBackup: Schema.Boolean,
+  officialBackupVersion: Schema.NullOr(Schema.String),
+  localBuild: Schema.NullOr(DesktopLocalUpgradeLocalBuildSchema),
+  officialRelease: Schema.NullOr(DesktopLocalUpgradeOfficialReleaseSchema),
+  liveDbMigrationId: Schema.NullOr(Schema.Number),
+  logPath: Schema.String,
+  repoDir: Schema.String,
+  repoBranch: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  repoBaseTag: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  upgradeInProgress: Schema.Boolean,
+});
+export type DesktopLocalUpgradeStatus = typeof DesktopLocalUpgradeStatusSchema.Type;
+
+export const DesktopLocalUpgradeStatusRequestSchema = Schema.Struct({
+  checkOfficial: Schema.optionalKey(Schema.Boolean),
+});
+
+export const DesktopLocalUpgradeRequestSchema = Schema.Struct({
+  target: DesktopLocalUpgradeTargetSchema,
+  buildFirst: Schema.optionalKey(Schema.Boolean),
+  syncUpstream: Schema.optionalKey(Schema.Boolean),
+  tag: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
+});
+export type DesktopLocalUpgradeRequest = typeof DesktopLocalUpgradeRequestSchema.Type;
+
+export const DesktopLocalUpgradeStartResultSchema = Schema.Struct({
+  started: Schema.Boolean,
+  logPath: Schema.String,
+  message: Schema.NullOr(Schema.String),
+});
+export type DesktopLocalUpgradeStartResult = typeof DesktopLocalUpgradeStartResultSchema.Type;
+
 export interface DesktopBridge {
   getAppBranding: () => DesktopAppBranding | null;
   getDatabaseMigrationProgress?: () => Promise<DatabaseMigrationProgress | null>;
@@ -1258,6 +1312,13 @@ export interface DesktopBridge {
     supportedLocales: () => Promise<readonly string[]>;
     prepare: (locale: string) => Promise<DesktopAppleSpeechResult>;
     transcribe: (input: { locale: string; pcm: Uint8Array }) => Promise<DesktopAppleSpeechResult>;
+  };
+  /** Fork-local macOS upgrade manager for switching between custom and official builds. */
+  localUpgrade?: {
+    getStatus: (options?: {
+      readonly checkOfficial?: boolean;
+    }) => Promise<DesktopLocalUpgradeStatus | null>;
+    run: (request: DesktopLocalUpgradeRequest) => Promise<DesktopLocalUpgradeStartResult>;
   };
 }
 

@@ -305,6 +305,11 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     transcribe: (input: { locale: string; pcm: Uint8Array }) =>
       ipcRenderer.invoke(IpcChannels.APPLE_SPEECH_TRANSCRIBE_CHANNEL, input),
   },
+  localUpgrade: {
+    getStatus: (options) =>
+      ipcRenderer.invoke(IpcChannels.LOCAL_UPGRADE_GET_STATUS_CHANNEL, options),
+    run: (request) => ipcRenderer.invoke(IpcChannels.LOCAL_UPGRADE_RUN_CHANNEL, request),
+  },
   openSystemSettings: (pane: string) =>
     ipcRenderer.invoke(IpcChannels.OPEN_SYSTEM_SETTINGS_CHANNEL, pane),
   probeRemoteEditors: () => ipcRenderer.invoke(IpcChannels.PROBE_REMOTE_EDITORS_CHANNEL, undefined),

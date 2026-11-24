@@ -161,3 +161,6 @@ export const COMPLETE_LEGACY_LOCAL_STORAGE_CHANNEL = "desktop:complete-legacy-lo
 export const RESTART_AUDIO_SERVICE_CHANNEL = "desktop:restart-audio-service";
 
 export const START_FILE_DRAG_CHANNEL = "desktop:start-file-drag";
+
+export const LOCAL_UPGRADE_GET_STATUS_CHANNEL = "desktop:local-upgrade-get-status";
+export const LOCAL_UPGRADE_RUN_CHANNEL = "desktop:local-upgrade-run";
